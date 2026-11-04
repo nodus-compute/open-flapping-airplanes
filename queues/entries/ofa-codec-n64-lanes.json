@@ -1,0 +1,39 @@
+{
+ "id": "ofa-codec-n64-lanes-80782af5e859",
+ "repo": "nodus-compute/open-flapping-airplanes",
+ "repo_sha": "80782af5e85907718e84324e0c3a4600359dc6b2",
+ "branch": "devin/1793766400-h100-repro",
+ "gpus": 1,
+ "cwd": "/home/ubuntu/ofa-80782af5e859",
+ "once": true,
+ "requires_free_gpus": 1,
+ "min_free_mib": 70000,
+ "require_gpu_name": "H100 80GB HBM3",
+ "min_driver_major": 580,
+ "sudo": false,
+ "priority": 76,
+ "out": "/home/ubuntu/gpu-queue-runs/ofa-codec-n64-lanes-80782af5e859",
+ "requires_paths": [
+  "/home/ubuntu/ofa-runs/stage-offline-80782af5e859.ready",
+  "/home/ubuntu/ofa-runs/codec-n32-lanes-c53d1d0e8985.passed"
+ ],
+ "argv": [
+  "bash",
+  "-c",
+  "cd /home/ubuntu/ofa-80782af5e859 && python3 h100/codec_verify.py \"$(cat /home/ubuntu/ofa-runs/codec-n32-lanes-c53d1d0e8985.passed)\" > /dev/null || exit 8 && O=$HOME/ofa-runs/codec-n64-lanes-80782af5e859-$(date -u +%Y%m%dT%H%M%SZ) && (GEMM=mma GPU={gpus} ALLOW_GPU0=$(test -n \"{allow_gpu0}\" && echo 1 || echo 0) OFFLINE=1 PY_DEPS=$HOME/ofa_pydeps-tf4.56.2 OUT=$O DATA=$HOME/ofa_data-staged-80782af5e859 TRUNK_CKPT_SUMMARY=$O/trunk_ckpt_summary.json TRAIN_BUBBLE_DATA=$HOME/training-bubble-data PREFLIGHT_DEADLINE_S=60 PREFIX_JOBS=32 TRUNK_CKPT_JOBS=1 TRUNK_CKPT_STEPS=4 CODEC_JOBS=64 CODEC_LR_CYCLE=1 TAIL_LANES=4 CODEC_STEPS=24 CODEC_DEC_TOKENS=2048 CODEC_BATCHES=\"1 8\" CODEC_RESERVE=\"0 16\" CODEC_ATTN_BWD=cuda CODEC_TS=1 PHASES=\"preflight build_trunk trunk_ckpt score_trunk_ckpt codec score_codec\" bash h100/stage_chain.sh --sha 80782af5e85907718e84324e0c3a4600359dc6b2 --jobs 32 --prefix-run PREFIX_RUN_PATH || true) && python3 h100/codec_verify.py $O > $O/codec_verify.json && printf \"%s\\n\" \"$O\" > /home/ubuntu/ofa-runs/codec-n64-lanes-80782af5e859.passed.tmp.$$ && mv -f /home/ubuntu/ofa-runs/codec-n64-lanes-80782af5e859.passed.tmp.$$ /home/ubuntu/ofa-runs/codec-n64-lanes-80782af5e859.passed"
+ ],
+ "prefix_run_arg": "replace PREFIX_RUN_PATH with the audited wall4x training_prefix N32 seed-413 top-layers-1 run dir (dedicated-0..31)",
+ "gates": {
+  "preflight": "60 s before any arm; per-GPU-UUID MPS (no mps-server on our UUID, no CUDA_MPS_* env, private empty pipe, compute mode Default); offline: complete HF snapshot + staged deps",
+  "network": "none at GPU run time (docker --network none, OFFLINE=1); all downloads in the ofa-stage-offline host entry",
+  "gpu": "{gpus} / {allow_gpu0} from the runner, no hardcoded index",
+  "no_ports": true,
+  "no_manual_mps": true,
+  "scorer": "codec_verify.py exit 0 (in-bundle: decode ids + 64 per-job losses bitwise vs solo16, TPOT, overlap, one launch, DCGM, 0 errors) -> atomic /home/ubuntu/ofa-runs/codec-n64-lanes-80782af5e859.passed"
+ },
+ "offline_compile": {
+  "note": "offline sm_90a ptxas -v, NON-EVIDENCE; trunk.cu identical to c53d1d0",
+  "mma_mw_kernel": "864 B stack, 428/396 B spill st/ld, 128 regs",
+  "wgmma_mw_kernel": "848 B stack, 428/396 B spill st/ld, 128 regs"
+ }
+}

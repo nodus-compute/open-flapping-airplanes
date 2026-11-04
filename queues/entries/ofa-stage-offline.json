@@ -1,0 +1,17 @@
+{
+ "id": "ofa-stage-offline-80782af5e859",
+ "priority": 80,
+ "repo_sha": "80782af5e85907718e84324e0c3a4600359dc6b2",
+ "cwd": "/home/ubuntu/ofa-80782af5e859",
+ "out": "/home/ubuntu/gpu-queue-runs/ofa-stage-offline-80782af5e859",
+ "sudo": false,
+ "scope": "host",
+ "requires_free_gpus": 0,
+ "once": true,
+ "min_free_mib": 0,
+ "argv": [
+  "bash",
+  "-c",
+  "cd /home/ubuntu/ofa-80782af5e859 && bash h100/stage_offline.sh --sha 80782af5e85907718e84324e0c3a4600359dc6b2 --py-deps $HOME/ofa_pydeps-tf4.56.2 --data $HOME/ofa_data-staged-80782af5e859 --marker /home/ubuntu/ofa-runs/stage-offline-80782af5e859.ready"
+ ]
+}
