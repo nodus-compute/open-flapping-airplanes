@@ -3,6 +3,7 @@
 #   GPU=0 ./h100/run_h100.sh                      # full run: prep build mk_train mk_split mk_paced mk_dyn pt_full pt_graph serve_full serve_mps mps_pair score
 #   PHASES="prep build mk_train mk_split" ./h100/run_h100.sh   # megakernel repro only
 #   OUT=h100/results/mw PHASES="build_mw mw score_mw" ./h100/run_h100.sh   # multi-workload arm (env MW_INFER_SMS 33, MW_STEPS, MW_DEC_TOKENS, MW_BATCHES "1 8")
+#   OUT=h100/results/ml PHASES="build_ml ml ml_vllm score_ml" ./h100/run_h100.sh   # multi-adapter LoRA decode (SGMV instruction) vs loop / PyTorch / vLLM
 # env: GPU (0) OUT (h100/results/run_<ts>) DATA (~/ofa_data, cached between runs) STEPS (4000) INFER_SMS (21 = FA's 24/148 of 132)
 #      ALLOW_GPU0 (0: GPU 0 is refused unless 1)  SUDO (sudo) SERVE_RATES ("100 400": open-loop demand in tok/s for mk_paced and mk_dyn)
 set -uo pipefail
@@ -119,5 +120,23 @@ if has mw; then
   done
 fi
 has score_mw && python3 "$ROOT/h100/mw_score.py" "$OUT"
+ML=/out/mlora_h100; MLB=${ML_BATCHES:-8 32 64}; MLA=${ML_ADAPTERS:-1 8 32}; MLT=${ML_DEC_TOKENS:-512}; HFC=${HF_CACHE:-$HOME/.cache/huggingface}
+has build_ml && dk $PT_IMG build_ml.log -- "cd llm/h100/mlora && nvcc -arch=sm_90a -O3 -std=c++17 --extended-lambda -maxrregcount=128 -Xptxas -v -o $ML mlora.cu"
+if has ml; then
+  mld() { local n=$1; shift; mkdir -p "$OUT/ml/$n"; dk $PT_IMG ml_$n.log -- "timeout -k 10 900 $ML $* --dump /out/ml/$n"; }
+  mld ref_sgmv_b8_a8 --lora sgmv --b 8 --adapters 8 --dec-tokens 16 --dump-ref
+  mld ref_none_b8 --lora none --b 8 --dec-tokens 16 --dump-ref
+  for r in ref_sgmv_b8_a8 ref_none_b8; do dk $PT_IMG ml_ref_$r.log -- "pip install -q numpy && python h100/mlora_ref.py check /out/ml/$r --out /out/ml_ref_$r.json"; done
+  for B in $MLB; do
+    mld none_b$B --lora none --b $B --dec-tokens $MLT
+    for A in $MLA; do [ "$A" -le "$B" ] || continue
+      mld loop_b${B}_a$A --lora loop --b $B --adapters $A --dec-tokens $MLT
+      mld sgmv_b${B}_a$A --lora sgmv --b $B --adapters $A --dec-tokens $MLT
+    done
+  done
+  dk $PT_IMG ml_torch.log -- "pip install -q numpy && python h100/mlora_ref.py bench --batches $MLB --adapters $MLA --out /out/ml_torch.json"
+fi
+has ml_vllm && dk $VLLM_IMG ml_vllm.log -v "$HFC":/root/.cache/huggingface -e HF_TOKEN -- "python3 h100/vllm_mlora.py --batches $MLB --adapters $MLA --out /out/ml_vllm.json"
+has score_ml && python3 "$ROOT/h100/mlora_score.py" "$OUT"
 has score && python3 "$ROOT/h100/score.py" "$OUT" ${COSCHED_SUMMARY:+--cosched-summary "$COSCHED_SUMMARY"}
 echo "artifacts: $OUT"
