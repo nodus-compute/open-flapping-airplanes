@@ -53,6 +53,7 @@ Upstream has no Hopper GEMM. Its H100 build runs A100-era `mma.sync` GEMMs, whil
 - Descriptor strides: copied from upstream's B300-verified tcgen05 kit.
 - Gate: phase `gemm_wg` runs upstream's `test_gemm_r2.cu` (all 15 model GEMM shapes vs an fp32 reference and cuBLAS, plus timing vs cuBLAS) on the
   sm90 backend. The `mk_wg_*` arms (training only, static split, dynamic split) run only if every shape PASSes.
+- Variant `ofa_h100_wg1` / arm `mk_wg1_train`: 1 block per SM with 255 registers (208 used, 0 spills, vs 128 regs at 2 blocks/SM).
 - Status: compiled with nvcc 12.8 for sm_90a but never executed, so expect the first GPU run to find descriptor or layout bugs.
 
 ## Score and gates (pre-registered, `score.py GATES`)

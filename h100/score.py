@@ -70,7 +70,7 @@ def collect(out):
 
 def summarize(arms, gates=GATES, cosched=None):
     s = {"gates": gates, "arms": arms, "errors": [], "verdict": False}
-    solo_train = {k: arms[k]["train_tok_s"] for k in ("mk_train", "mk_wg_train", "pt_full", "pt_graph", "te_graph")
+    solo_train = {k: arms[k]["train_tok_s"] for k in ("mk_train", "mk_wg_train", "mk_wg1_train", "pt_full", "pt_graph", "te_graph")
                   if k in arms and arms[k].get("train_tok_s")}
     solo_serve = arms.get("serve_full", {}).get("serve_tok_s")
     if not solo_train:

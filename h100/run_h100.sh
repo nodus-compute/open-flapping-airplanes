@@ -39,7 +39,7 @@ has prep && dk $PT_IMG prep.log -- "pip install -q tiktoken numpy && python h100
 has build && dk $PT_IMG build.log -- "cd llm/b200/megakernel && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100 -DOFA_GEMM_BACKEND=0 && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100_dyn -DOFA_GEMM_BACKEND=0 -DOFA_NODUS_DYN=1"
 # Hopper wgmma + TMA GEMM backend (llm/h100/gemm_sm90.cuh, -DOFA_GEMM_BACKEND=3): gemm_wg checks every model GEMM shape against cuBLAS with upstream's
 # test_gemm_r2.cu first; the mk_wg* arms are skipped unless every shape reports PASS
-has build_wg && dk $PT_IMG build_wg.log -- "cd llm/b200/gemm_tcgen05 && nvcc -arch=sm_90a -O3 -std=c++17 -DOFA_GEMM_BACKEND=3 -o /out/gemm_test_sm90 test_gemm_r2.cu -lcublas && cd ../megakernel && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100_wg -DOFA_GEMM_BACKEND=3 && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100_wg_dyn -DOFA_GEMM_BACKEND=3 -DOFA_NODUS_DYN=1"
+has build_wg && dk $PT_IMG build_wg.log -- "cd llm/b200/gemm_tcgen05 && nvcc -arch=sm_90a -O3 -std=c++17 -DOFA_GEMM_BACKEND=3 -o /out/gemm_test_sm90 test_gemm_r2.cu -lcublas && cd ../megakernel && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100_wg -DOFA_GEMM_BACKEND=3 && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100_wg_dyn -DOFA_GEMM_BACKEND=3 -DOFA_NODUS_DYN=1 && MAXREG=255 NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100_wg1 -DOFA_GEMM_BACKEND=3 -DOFA_BLOCKS_PER_SM=1"
 has gemm_wg && dk $PT_IMG gemm_wg.log -- "timeout -k 10 900 /out/gemm_test_sm90 --nopersist"
 WG_OK=0; [ -f "$OUT/gemm_wg.log" ] && grep -q PASS "$OUT/gemm_wg.log" && ! grep -q FAIL "$OUT/gemm_wg.log" && WG_OK=1
 MK=/out/ofa_h100
@@ -53,6 +53,7 @@ for R in ${SERVE_RATES:-100 400}; do
 done
 if [ "$WG_OK" = 1 ]; then
   has mk_wg && dk $PT_IMG mk_wg_train.log -- "timeout -k 10 1800 ${MK}_wg $BASE --no-doom --steps $STEPS --loss-out /out/mk_wg_train_loss.txt"
+  has mk_wg && dk $PT_IMG mk_wg1_train.log -- "timeout -k 10 1800 ${MK}_wg1 $BASE --no-doom --steps $STEPS --loss-out /out/mk_wg1_train_loss.txt"   # 1 block/SM, 255 regs: no accumulator spills
   has mk_wg && dk $PT_IMG mk_wg_split.log -- "timeout -k 10 1800 ${MK}_wg --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --loss-out /out/mk_wg_split_loss.txt"
   for R in ${SERVE_RATES:-100 400}; do
     has mk_wg && dk $PT_IMG mk_wg_dyn_$R.log -- "timeout -k 10 1800 ${MK}_wg_dyn --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --serve-rate $R --lend --loss-out /out/mk_wg_dyn_${R}_loss.txt"
