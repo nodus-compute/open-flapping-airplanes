@@ -2,7 +2,7 @@
 
 Fork of https://github.com/Bobliuuu/open-flapping-airplanes, upstream SHA `9dd7dd0d3c1fc0245b43897eacd8d62aa096c4c1`. Upstream ships A100 (`mma.sync`),
 B200 and B300 (`tcgen05`) builds and has no H100 build. This directory runs the SM-count-parameterised megakernel (`llm/b200/megakernel/ofa_r2.cu`,
-`mma.sync` GEMM backend, built for `sm_90a`, Doom compiled out with `NODOOM=1`) on a 132-SM H100. It compares that build with solo and MPS-split
+`mma.sync` GEMM backend forced with `-DOFA_GEMM_BACKEND=0` (the r2 header defaults to 2, which falls back to mma.sync off sm_100), built for `sm_90a`, Doom compiled out with `NODOOM=1`) on a 132-SM H100. It compares that build with solo and MPS-split
 baselines and scores combined useful work per GPU-second. Nothing here has run on an H100 yet, so there are no measured numbers.
 
 ## Command (1x H100; needs docker + nvidia-container-toolkit; the vLLM 0.30 image needs driver >= 580)
