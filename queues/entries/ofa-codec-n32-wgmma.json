@@ -1,0 +1,41 @@
+{
+ "id": "ofa-codec-n32-wgmma-5d01b8806bdd",
+ "repo": "nodus-compute/open-flapping-airplanes",
+ "repo_sha": "5d01b8806bdd42f935da91478a1aa2adb9228d36",
+ "branch": "devin/1793766400-h100-repro",
+ "gpus": 1,
+ "priority": 76,
+ "cwd": "/home/ubuntu/ofa-5d01b8806bdd",
+ "out": "/home/ubuntu/gpu-queue-runs/ofa-codec-n32-wgmma-5d01b8806bdd",
+ "once": true,
+ "requires_free_gpus": 1,
+ "forbidden_gpu_indices": [
+  0
+ ],
+ "min_free_mib": 70000,
+ "require_gpu_name": "H100 80GB HBM3",
+ "min_driver_major": 580,
+ "sudo": false,
+ "requires_paths": [
+  "/home/ubuntu/ofa-runs/codec-n32-ts-9873b7990eec.passed"
+ ],
+ "argv": [
+  "bash",
+  "-c",
+  "cd /home/ubuntu/ofa-5d01b8806bdd && python3 h100/codec_verify.py \"$(cat $HOME/ofa-runs/codec-n32-ts-9873b7990eec.passed)\" > /dev/null || exit 8 && O=$HOME/ofa-runs/codec-n32-wgmma-5d01b8806bdd-$(date -u +%Y%m%dT%H%M%SZ) && (GEMM=wgmma GPU={gpu} OUT=$O DATA=$HOME/ofa_data-codec-n32-wgmma-5d01b8806bdd TRUNK_CKPT_SUMMARY=$O/trunk_ckpt_summary.json TRAIN_BUBBLE_DATA=$HOME/training-bubble-data PREFLIGHT_DEADLINE_S=60 PREFIX_JOBS=32 TRUNK_CKPT_JOBS=1 TRUNK_CKPT_STEPS=4 CODEC_JOBS=32 CODEC_STEPS=24 CODEC_DEC_TOKENS=2048 CODEC_BATCHES=\"1 8\" CODEC_RESERVE=\"0 16\" CODEC_ATTN_BWD=cuda CODEC_TS=1 PHASES=\"preflight build_trunk trunk_ckpt score_trunk_ckpt codec score_codec\" bash h100/stage_chain.sh --sha 5d01b8806bdd42f935da91478a1aa2adb9228d36 --jobs 32 --prefix-run PREFIX_RUN_PATH || true) && python3 h100/codec_verify.py $O > $O/codec_verify.json && R=$(cat $HOME/ofa-runs/codec-n32-ts-9873b7990eec.passed) && for f in cdc/train/loss.f32 cdc/dec_b1/toks.i32 cdc/dec_b8/toks.i32 cdc/co_b8_r0/loss.f32 cdc/co_b8_r0/toks.i32 cdc/co_b1_r0/loss.f32 cdc/co_b1_r0/toks.i32; do cmp -s \"$R/$f\" \"$O/$f\" && echo \"same $f\" || echo \"DIFF $f\"; done > $O/wgmma_vs_mma_bitwise.txt"
+ ],
+ "prefix_run_arg": "replace PREFIX_RUN_PATH with the audited wall4x training_prefix N32 seed-413 top-layers-1 run dir (dedicated-0..31)",
+ "purpose": "H100 A/B mma vs wgmma GEMM backend: same N32 config as ofa-codec-n32-ts-9873b7990eec with GEMM=wgmma; throughput = this codec_verify.json vs the mma bundles (9873b7990eec and ofa-codec-n32-spill-5d01b8806bdd)",
+ "gates": {
+  "n32_baseline_passed": "requires_paths marker + codec_verify re-pass (exit 8)",
+  "verifier": "h100/codec_verify.py exit 0 (all in-bundle bitwise gates: co vs solo within the wgmma build)",
+  "bitwise_vs_mma_bundle": "REPORT-ONLY: wgmma_vs_mma_bitwise.txt lists same/DIFF per file (different MMA instruction and accumulation order may change bits by design)",
+  "preflight_within_first_seconds": 60
+ },
+ "reports": [
+  "preflight.json",
+  "codec_summary.json",
+  "codec_verify.json",
+  "wgmma_vs_mma_bitwise.txt"
+ ]
+}
