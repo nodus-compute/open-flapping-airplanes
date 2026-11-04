@@ -19,6 +19,9 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "../../gemm/gemm.cuh"
+#ifdef MW_GEMM_WG
+#include "../gemm_sm90.cuh"
+#endif
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1);} } while (0)
 typedef __nv_bfloat16 bf16;
@@ -27,11 +30,20 @@ typedef unsigned long long u64;
 constexpr int D = 2560, NQ = 4096, NKV = 1024, NQV = NQ + NKV, NQKV = NQ + 2 * NKV, HD = 128, NKVH = 8, VOC = 151936, R = 8, R2 = 2 * R;
 constexpr int PJ = 2 * R * D + NQV * R;            // per-job fp32 params: Aq[R][D] Av[R][D] Bq[NQ][R] Bv[NKV][R]
 constexpr int MAXB = 8, MAXPOS = 4096, THREADS = 256, ROWS = 16;
-constexpr int SMEM = gemm::smem_bytes();           // 64 KB
+#ifdef MW_GEMM_WG
+constexpr int SMEM = gemm::sm90::smem_bytes() > gemm::smem_bytes() ? gemm::sm90::smem_bytes() : gemm::smem_bytes();
+#else
+constexpr int SMEM = gemm::smem_bytes();
+#endif
+//           // 64 KB
 static_assert(4 * MAXPOS * 4 <= SMEM, "attention scores fit the GEMM smem");
 
 enum Kind { T_BASEQ, T_BASEV, T_DOWN, T_UPG, T_DB, T_DU, T_DA, T_ADAM, T_LOSS, D_DOWN, D_QKV, D_ATT, D_O, D_HEAD, D_NEXT };
-struct Ph { int kind, ntasks, tilesM; gemm::Args ga; };
+struct Ph { int kind, ntasks, tilesM; gemm::Args ga;
+#ifdef MW_GEMM_WG
+  const CUtensorMap* tmB; const CUtensorMap* const* tmAx;   // wgmma/TMA backend: B map + one A map per X slot
+#endif
+};
 struct Job {
   int nph, tps, limit, last_ph;
   const Ph* ph; const int *prefix, *ntasks, *dep_off, *dep_cnt; const int2* deps;
@@ -99,8 +111,13 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
   const bf16* X = C.X + (size_t)(step % C.nx) * tk * D;
   switch (d.kind) {
     case T_BASEQ: case T_BASEV: {
+#ifdef MW_GEMM_WG
+      gemm::sm90::ArgsWG a; static_cast<gemm::Args&>(a) = d.ga; a.A = X; a.tmA = d.tmAx[step % C.nx]; a.tmB = d.tmB;
+      gemm::sm90::tile<gemm::NT, gemm::EPI_BF16>(a, local % d.tilesM, local / d.tilesM, smem); break;
+#else
       gemm::Args a = d.ga; a.A = X;
       gemm::gemm_tile<gemm::NT, gemm::EPI_BF16>(a, local % d.tilesM, local / d.tilesM, smem); break;
+#endif
     }
     case T_DOWN: {                                             // U[j][t][r16] = sum_d X[t][d] * A_{q|v}[r][d]
       const int j = local / rb_per_job, t = (local % rb_per_job) * ROWS + tid / R2, r = tid % R2;
@@ -424,6 +441,15 @@ int main(int argc, char** argv) {
   for (Ph* p : {&q, &v}) { const int n = p == &q ? NQ : NKV; p->ga.A = C.X; p->ga.B = p == &q ? C.Wq : C.Wv; p->ga.C = p == &q ? (void*)C.Yq : (void*)C.Yv;
     p->ga.lda = D; p->ga.ldb = D; p->ga.ldc = n; p->ga.ldaux = 8; p->ga.M = tk; p->ga.N = n; p->ga.K = D; p->tilesM = tk / 128; p->ntasks = (tk / 128) * (n / 128);
     if (!gemm::args_ok(p->ga)) { fprintf(stderr, "bad GEMM args\n"); return 2; } }
+#ifdef MW_GEMM_WG
+  for (Ph* p : {&q, &v}) { std::vector<const CUtensorMap*> maps(nx);
+    for (int x = 0; x < nx; x++) maps[x] = gemm::sm90::make_map(C.X + (size_t)x * tk * D, D, tk, D, 64, 128);
+    const CUtensorMap** dm; CK(cudaMalloc(&dm, nx * sizeof(void*))); CK(cudaMemcpy(dm, maps.data(), nx * sizeof(void*), cudaMemcpyHostToDevice));
+    p->tmAx = dm; p->tmB = gemm::sm90::make_map(p->ga.B, D, p->ga.N, D, 64, 128); }
+  printf("gemm_backend wgmma\n");
+#else
+  printf("gemm_backend mma_sync\n");
+#endif
   const int ADAM = 7, LOSS = 8;
   Bt.add(q, {make_int2(LOSS, -1)}); Bt.add(v, {make_int2(LOSS, -1)});
   Bt.add(mk(T_DOWN, rbt), {make_int2(ADAM, -1)});

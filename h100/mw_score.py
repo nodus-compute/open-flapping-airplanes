@@ -99,7 +99,8 @@ def main(out):
               f"decode tok/s solo {solo['tok_s']} co {row['co']['tok_s']} mps {row['mps']['tok_s']} | p99 co/solo {row['p99_vs_solo']} | "
               f"U co {cu} mps {mu} | gates {gates}")
     res["all_gates_pass"] = ok_all and bool(res["batches"])
-    res["gemm_backend"] = "mma_sync"
+    gb = (out / "gemm_backend").read_text().strip() if (out / "gemm_backend").exists() else "mma"
+    res["gemm_backend"] = "wgmma" if gb == "wgmma" else "mma_sync"
     (out / "mw_summary.json").write_text(json.dumps(res, indent=1))
     print("all_gates_pass", res["all_gates_pass"])
 

@@ -101,7 +101,11 @@ fi
 # ---- multi-workload megakernel (llm/h100/mw): 16-job LoRA-tail training (Qwen3-4B q/v, rank 8) + one-adapter decode, ONE launch
 MW=/out/mw_h100; MWI=${MW_INFER_SMS:-33}; MWS=${MW_STEPS:-3000}; MWT=${MW_DEC_TOKENS:-3000}
 MW_TRAIN_PCT=$(( (100 * (TOTAL - MWI) + TOTAL / 2) / TOTAL )); MW_INFER_PCT=$(( (100 * MWI + TOTAL / 2) / TOTAL ))
-has build_mw && dk $PT_IMG build_mw.log -- "cd llm/h100/mw && nvcc -arch=sm_90a -O3 -std=c++17 --extended-lambda -maxrregcount=128 -Xptxas -v -o $MW mw.cu"
+# GEMM backend for the mw/sched training GEMM tiles: GEMM=mma (default) | wgmma | auto (reads the wgmma track's gemm_choice).
+GEMM=${GEMM:-mma}; [ "$GEMM" = auto ] && GEMM=$(cat "${GEMM_CHOICE:-$ROOT/h100/results/wgmma/gemm_choice}" 2>/dev/null || echo mma)
+case "$GEMM" in wgmma) GFLAG=-DMW_GEMM_WG=1 ;; mma) GFLAG= ;; *) echo "GEMM must be mma, wgmma or auto"; exit 2 ;; esac
+echo "$GEMM" > "$OUT/gemm_backend"
+has build_mw && dk $PT_IMG build_mw.log -- "cd llm/h100/mw && nvcc -arch=sm_90a -O3 -std=c++17 --extended-lambda -maxrregcount=128 -Xptxas -v $GFLAG -o $MW mw.cu"
 if has mw; then
   mwd() { mkdir -p "$OUT/mw/$1"; local n=$1; shift; dk $PT_IMG mw_$n.log "$@"; }
   mwd train16 -- "timeout -k 10 600 $MW --mode train --steps 16 --dump /out/mw/train16"
@@ -146,7 +150,7 @@ SC_DEC_PCT=${SCHED_MPS_DEC_PCT:-25}
 dcgm_on() { if command -v dcgmi >/dev/null 2>&1; then dcgmi dmon -i "$GPU" -e 1002,1003,1004,1005 -d 100 > "$OUT/dcgm_$1.txt" 2>&1 &
   else nvidia-smi -i "$GPU" --query-gpu=timestamp,utilization.gpu,utilization.memory,clocks.sm --format=csv -lms 100 > "$OUT/dcgm_$1.txt" 2>&1 & fi; DCGM_PID=$!; }
 dcgm_off() { kill "$DCGM_PID" 2>/dev/null; wait "$DCGM_PID" 2>/dev/null || true; }
-has build_sched && dk $PT_IMG build_sched.log -- "cd llm/h100/sched && nvcc -arch=sm_90a -O3 -std=c++17 --extended-lambda -maxrregcount=128 -Xptxas -v -o $SC sched.cu"
+has build_sched && dk $PT_IMG build_sched.log -- "cd llm/h100/sched && nvcc -arch=sm_90a -O3 -std=c++17 --extended-lambda -maxrregcount=128 -Xptxas -v $GFLAG -o $SC sched.cu"
 if has sched; then
   scd() { local n=$1; shift; mkdir -p "$OUT/sched/$n"; dk $PT_IMG sched_$n.log "$@"; }
   scd train_ref -- "timeout -k 10 600 $SC --mode train --steps 64 --dump /out/sched/train_ref"

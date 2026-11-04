@@ -103,7 +103,8 @@ def main(out):
         gates[f"{tag}_prio_p99_within_{P99_MAX}x_solo"] = row["prio_p99_vs_solo"] is not None and row["prio_p99_vs_solo"] <= P99_MAX
         rows.append(row)
     summary = {"train_solo_dcgm": dcgm(out, "train_solo"), "rows": rows, "gates": gates, "all_gates_pass": bool(gates) and all(gates.values())}
-    summary["gemm_backend"] = "mma_sync"
+    gb = (out / "gemm_backend").read_text().strip() if (out / "gemm_backend").exists() else "mma"
+    summary["gemm_backend"] = "wgmma" if gb == "wgmma" else "mma_sync"
     (out / "sched_summary.json").write_text(json.dumps(summary, indent=1))
     keys = ["rate_req_s", "train_alone_steps_s", "fifo_train_steps_s", "prio_train_steps_s", "mps_train_steps_s", "decode_solo_req_p99_ms",
             "fifo_p99_vs_solo", "prio_p99_vs_solo", "mps_p99_vs_solo", "prio_vs_mps_train"]
