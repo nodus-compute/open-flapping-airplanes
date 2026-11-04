@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "../../gemm/gemm.cuh"
+#include <random>
 #ifdef MW_GEMM_WG
 #include "../gemm_sm90.cuh"
 #endif
@@ -37,8 +38,8 @@ constexpr int SMEM = gemm::smem_bytes();
 //           // 64 KB
 static_assert(4 * MAXPOS * 4 <= SMEM, "attention scores fit the GEMM smem");
 
-enum Kind { T_BASEQ, T_BASEV, T_DOWN, T_UPG, T_DB, T_DU, T_DA, T_ADAM, T_LOSS, D_DOWN, D_QKV, D_ATT, D_O, D_HEAD, D_NEXT, T_TUP, T_TDN };
-struct Ph { int kind, ntasks, tilesM, reps, layer; gemm::Args ga;
+enum Kind { T_BASEQ, T_BASEV, T_DOWN, T_UPG, T_DB, T_DU, T_DA, T_ADAM, T_LOSS, D_DOWN, D_QKV, D_ATT, D_O, D_HEAD, D_NEXT, T_TUP, T_TDN, T_TCV };
+struct Ph { int kind, ntasks, tilesM, reps, layer, f32, koff; gemm::Args ga;
 #ifdef MW_GEMM_WG
   const CUtensorMap* tmB; const CUtensorMap* const* tmAx;   // wgmma/TMA backend: B map + one A map per X slot
 #endif
@@ -53,6 +54,7 @@ struct Ctx {
   // train
   int jobs, tk, nx; float scale, lr, b1, b2, eps, inv;
   const bf16 *X, *Wq, *Wv, *Tq, *Tv; bf16 *Yq, *Yv;
+  int L; const u64* arr; u64 *t0, *tmax; u64 max_ns;   // request decode: L tokens/request, Poisson arrivals (ns after t0); per-kind max train-task ns
   int lt; bf16 *Xt[2], *Ht, *junk;   // frozen shared trunk: lt layers, ping-pong outputs, MLP hidden, per-job-arm scratch
   float *P, *G, *M, *Vm, *U, *dO, *dU, *lpart, *loss; u64* step_done;
   // decode
@@ -118,17 +120,25 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
       gemm::gemm_tile<gemm::NT, gemm::EPI_BF16>(a, local % d.tilesM, local / d.tilesM, smem); break;
 #endif
     }
-    case T_TUP: case T_TDN: {                                  // frozen trunk GEMM; reps > 1 = per-job arm (rep > 0 writes scratch)
-      const int base = d.ntasks / d.reps, rep = local / base, l2 = local % base;
-      const bf16* A = d.kind == T_TUP ? (d.layer ? C.Xt[d.layer % 2] : C.X + (size_t)(step % C.nx) * tk * D) : C.Ht;
+    case T_TUP: case T_TDN: {                                  // frozen trunk GEMM (K chunk d.koff if split); reps > 1 = per-job arm (rep > 0 writes scratch)
+      const int base = d.ntasks / d.reps, rep = local / base, l2 = local % base, x0 = d.kind == T_TUP && !d.layer;
+      const bf16* A = x0 ? C.X + (size_t)(step % C.nx) * tk * D + d.koff : (const bf16*)d.ga.A;
 #ifdef MW_GEMM_WG
-      gemm::sm90::ArgsWG a; static_cast<gemm::Args&>(a) = d.ga; a.A = A; a.tmA = d.tmAx[d.kind == T_TUP && !d.layer ? step % C.nx : 0]; a.tmB = d.tmB;
+      gemm::sm90::ArgsWG a; static_cast<gemm::Args&>(a) = d.ga; a.A = A; a.tmA = d.tmAx[x0 ? step % C.nx : 0]; a.tmB = d.tmB;
       if (rep) a.C = C.junk;
-      gemm::sm90::tile<gemm::NT, gemm::EPI_BF16>(a, l2 % d.tilesM, l2 / d.tilesM, smem); break;
+      if (d.f32) gemm::sm90::tile<gemm::NT, gemm::EPI_F32>(a, l2 % d.tilesM, l2 / d.tilesM, smem);
+      else gemm::sm90::tile<gemm::NT, gemm::EPI_BF16>(a, l2 % d.tilesM, l2 / d.tilesM, smem);
 #else
       gemm::Args a = d.ga; a.A = A; if (rep) a.C = C.junk;
-      gemm::gemm_tile<gemm::NT, gemm::EPI_BF16>(a, l2 % d.tilesM, l2 / d.tilesM, smem); break;
+      if (d.f32) gemm::gemm_tile<gemm::NT, gemm::EPI_F32>(a, l2 % d.tilesM, l2 / d.tilesM, smem);
+      else gemm::gemm_tile<gemm::NT, gemm::EPI_BF16>(a, l2 % d.tilesM, l2 / d.tilesM, smem);
 #endif
+      break;
+    }
+    case T_TCV: {                                              // split-K trunk: fp32 accumulator -> bf16 activations
+      const float* src = (const float*)d.ga.A; bf16* dst = (bf16*)d.ga.C; const size_t i0 = (size_t)local * THREADS * 8;
+      for (int i = 0; i < 8; i++) { const size_t k = i0 + (size_t)i * THREADS + tid; dst[k] = __float2bfloat16(src[k]); }
+      break;
     }
     case T_DOWN: {                                             // U[j][t][r16] = sum_d X[t][d] * A_{q|v}[r][d]
       const int j = local / rb_per_job, t = (local % rb_per_job) * ROWS + tid / R2, r = tid % R2;
@@ -206,7 +216,7 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
 // ------------------------------------------------------------------------------------------------ decode tasks (one token step)
 __device__ void decode_task(const Ctx& C, const Ph& d, int local, int step, char* smem) {
   float* sm = reinterpret_cast<float*>(smem);
-  const int tid = threadIdx.x, b = C.b, pos = C.ctx0 + step;
+  const int tid = threadIdx.x, b = C.b, pos = C.ctx0 + (C.L ? step % C.L : step);
   const float* Bq = C.adp + 2 * R * D; const float* Bv = Bq + (size_t)NQ * R;
   switch (d.kind) {
     case D_DOWN: {
@@ -302,6 +312,54 @@ __device__ bool try_lend(const Ctx& C, char* smem) {
   return true;
 }
 
+// request decode: a request's first token is released only at its arrival time
+__device__ __forceinline__ bool arrived(const Ctx& C, int dec, int step, int ph) {
+  return !(dec && C.L && ph == 0 && step % C.L == 0 && gtimer() < *reinterpret_cast<const volatile u64*>(C.t0) + C.arr[step / C.L]);
+}
+__device__ __forceinline__ void finish_dec(const Ctx& C, const Job& J, int ph, int step) {
+  const int old = atomicAdd(J.done + ph, 1);
+  if (ph == J.last_ph && old == J.ntasks[ph] * (step + 1) - 1) { C.tok_done[step] = gtimer();
+    if (C.L && step == J.limit - 1) { __threadfence(); *reinterpret_cast<volatile int*>(C.finished) = 1; } }   // last request done: stop training
+}
+// --sm-split dynamic: non-blocking claim of a queue head; 1 = ran, 0 = head not ready, 2 = queue done
+__device__ int try_claim(const Ctx& C, const Job& J, int dec, char* smem) {
+  __shared__ volatile int s_c[4];
+  if (threadIdx.x == 0) {
+    int st = 0, step = 0, ph = 0, local = 0;
+    const unsigned g = *reinterpret_cast<const volatile unsigned*>(J.ticket);
+    if (g >= (unsigned)J.limit * (unsigned)J.tps || ld_vol(C.finished)) st = 2;
+    else {
+      step = (int)(g / (unsigned)J.tps); const int r = (int)(g - (unsigned)step * (unsigned)J.tps);
+      while (r >= J.prefix[ph + 1]) ph++;
+      local = r - J.prefix[ph];
+      bool ready = arrived(C, dec, step, ph);
+      for (int k = 0; k < J.dep_cnt[ph] && ready; k++) { const int2 e = J.deps[J.dep_off[ph] + k]; const int need = J.ntasks[e.x] * (step + 1 + e.y);
+        if (need > 0 && ld_acq(J.done + e.x) < need) ready = false; }
+      if (ready && atomicCAS(J.ticket, g, g + 1) == g) st = 1;
+    }
+    s_c[0] = st; s_c[1] = step; s_c[2] = ph; s_c[3] = local;
+  }
+  __syncthreads();
+  const int st = s_c[0], step = s_c[1], ph = s_c[2], local = s_c[3];
+  __syncthreads();
+  if (st != 1) return st;
+  const u64 ts = gtimer();
+  if (dec) decode_task(C, J.ph[ph], local, step, smem); else train_task(C, J.ph[ph], local, step, smem);
+  __threadfence(); __syncthreads();
+  if (threadIdx.x == 0) { if (dec) finish_dec(C, J, ph, step); else { finish_train(C, J, ph, step); atomicMax(C.tmax + J.ph[ph].kind, gtimer() - ts); } }
+  __syncthreads();
+  return 1;
+}
+// strict priority on every SM: a ready decode instruction first, a trunk/LoRA tile only when no decode instruction is ready
+__device__ void dyn_loop(const Ctx& C, char* smem) {
+  for (;;) {
+    const int a = try_claim(C, C.dc, 1, smem); if (a == 1) continue;
+    const int b = try_claim(C, C.tr, 0, smem); if (b == 1) continue;
+    if (a == 2 && b == 2) break;
+    if (threadIdx.x == 0) __nanosleep(64);
+  }
+}
+
 // ------------------------------------------------------------------------------------------------ persistent loop (OFA fetch-add ticket claim)
 __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
   __shared__ volatile int s_sel[4];
@@ -310,7 +368,8 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
   for (;;) {
     if (tid == 0) {
       int res = 0, step = 0, ph = 0, local = 0;
-      if (job_id == 1 && C.mode == 2 && ld_vol(C.finished)) res = -2;
+      if ((job_id == 1 && C.mode == 2 && ld_vol(C.finished)) || (job_id == 0 && C.L && ld_vol(C.finished)) ||
+          (job_id == 0 && C.max_ns && gtimer() - *reinterpret_cast<const volatile u64*>(C.t0) > C.max_ns)) res = -2;
       else {
         unsigned g; if (pend) { g = pend_g; pend = 0; } else g = atomicAdd(J.ticket, 1u);
         if (g >= total) res = -2;
@@ -326,7 +385,7 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
                 const int2 e = J.deps[J.dep_off[ph] + k]; const int need = J.ntasks[e.x] * (step + 1 + e.y);
                 if (need > 0 && ld_acq(J.done + e.x) < need) ready = false;
               }
-              if (ready) { rstep = step; rph = ph; break; }
+              if (ready && arrived(C, job_id, step, ph)) { rstep = step; rph = ph; break; }
               if (job_id == 1 && C.mode == 2 && ld_vol(C.finished)) { res = -2; break; }
               if (job_id == 1 && C.lend) { pend = 1; pend_g = g; res = -3; break; }
               __nanosleep(64);
@@ -341,12 +400,13 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
     __syncthreads();
     if (res == -3) { if (!try_lend(C, smem) && tid == 0) __nanosleep(64); continue; }
     if (res < 0) break;
+    const u64 ts = gtimer();
     if (job_id == 0) train_task(C, J.ph[ph], local, step, smem); else decode_task(C, J.ph[ph], local, step, smem);
     __threadfence();
     __syncthreads();
     if (tid == 0) {
-      if (job_id == 0) finish_train(C, J, ph, step);
-      else { const int old = atomicAdd(J.done + ph, 1); if (ph == J.last_ph && old == J.ntasks[ph] * (step + 1) - 1) C.tok_done[step] = gtimer(); }
+      if (job_id == 0) { finish_train(C, J, ph, step); atomicMax(C.tmax + J.ph[ph].kind, gtimer() - ts); }
+      else finish_dec(C, J, ph, step);
     }
   }
 }
@@ -356,7 +416,10 @@ __global__ void __launch_bounds__(THREADS, 2) mw_kernel(const Ctx C) {
   unsigned hw; asm volatile("mov.u32 %0, %%smid;" : "=r"(hw));
   const int smid = C.smid_rank ? C.smid_rank[hw] : (int)hw;
   char* smem = reinterpret_cast<char*>(dsm);
-  if (C.mode == 0) job_loop(C, C.tr, 0, smem);
+  if (threadIdx.x == 0) atomicCAS(C.t0, 0ull, gtimer());
+  __syncthreads();
+  if (C.mode == 3) dyn_loop(C, smem);
+  else if (C.mode == 0) job_loop(C, C.tr, 0, smem);
   else if (C.mode == 1) { if (C.infer_sms <= 0 || smid < C.infer_sms) job_loop(C, C.dc, 1, smem); }
   else if (smid < C.infer_sms) job_loop(C, C.dc, 1, smem);
   else job_loop(C, C.tr, 0, smem);
@@ -395,17 +458,21 @@ static void pct(std::vector<double> v, double& p50, double& p99) { if (v.empty()
 int main(int argc, char** argv) {
   std::string mode_s = "co", dir; int jobs = 16, tk = 512, steps = 16, b = 1, ctx0 = 1024, dtok = 2048, infer_sms = 33, nx = 4, lend = 0; u64 seed = 1234;
   int lt = 0, jb = 0; std::string trunk_s = "shared";
+  int nreq = 64, Lr = 64, kc = 0; double rate = 0, max_s = 0; std::string split_s = "static";
   for (int i = 1; i < argc; i++) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s) && i + 1 < argc; };
     if (is("--mode")) mode_s = argv[++i]; else if (is("--jobs")) jobs = atoi(argv[++i]); else if (is("--tokens")) tk = atoi(argv[++i]);
     else if (is("--steps")) steps = atoi(argv[++i]); else if (is("--b")) b = atoi(argv[++i]); else if (is("--ctx")) ctx0 = atoi(argv[++i]);
     else if (is("--dec-tokens")) dtok = atoi(argv[++i]); else if (is("--infer-sms")) infer_sms = atoi(argv[++i]); else if (is("--dump")) dir = argv[++i];
+    else if (is("--sm-split")) split_s = argv[++i]; else if (is("--rate")) rate = atof(argv[++i]); else if (is("--nreq")) nreq = atoi(argv[++i]);
+    else if (is("--req-tokens")) Lr = atoi(argv[++i]); else if (is("--trunk-kchunk")) kc = atoi(argv[++i]); else if (is("--max-seconds")) max_s = atof(argv[++i]);
     else if (is("--trunk-layers")) lt = atoi(argv[++i]); else if (is("--trunk")) trunk_s = argv[++i]; else if (is("--job-base")) jb = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--lend")) lend = 1; else if (is("--seed")) seed = atoll(argv[++i]); else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
   }
+  if (rate > 0) dtok = nreq * Lr;
   const int mode = mode_s == "train" ? 0 : mode_s == "dec" ? 1 : mode_s == "co" ? 2 : -1;
-  if (lt < 0 || lt > 64 || jb < 0 || (trunk_s != "shared" && trunk_s != "perjob")) { fprintf(stderr, "bad --trunk-layers (0..64) / --trunk shared|perjob / --job-base\n"); return 2; }
-  if (mode < 0 || jobs < 1 || jobs > THREADS || tk % 128 || b < 1 || b > MAXB || ctx0 < 1 || steps < 1 || (mode != 0 && ctx0 + dtok > MAXPOS)) {
+  if (lt < 0 || lt > 64 || jb < 0 || (trunk_s != "shared" && trunk_s != "perjob") || (split_s != "static" && split_s != "dynamic") || (rate > 0 && (nreq < 1 || Lr < 2)) || kc < 0) { fprintf(stderr, "bad --trunk-layers (0..64) / --trunk shared|perjob / --job-base\n"); return 2; }
+  if (mode < 0 || jobs < 1 || jobs > THREADS || tk % 128 || b < 1 || b > MAXB || ctx0 < 1 || steps < 1 || (mode != 0 && ctx0 + (rate > 0 ? Lr : dtok) > MAXPOS)) {
     fprintf(stderr, "bad args: --mode train|dec|co, --tokens multiple of 128, 1<=b<=8, ctx+dec-tokens<=%d\n", MAXPOS); return 2; }
   cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, 0)); const int nsm = prop.multiProcessorCount;
   if (mode == 2 && (infer_sms < 1 || infer_sms >= nsm)) { fprintf(stderr, "--infer-sms must be in [1,%d)\n", nsm); return 2; }
@@ -423,7 +490,11 @@ int main(int argc, char** argv) {
   printf("GPU %s, %d SMs, %d blocks (%d/SM); mode %s; train jobs %d x %d tokens, q/v rank %d, %d steps; decode b=%d ctx %d, %d tokens, infer SMs %d\n",
          prop.name, nsm, nblocks, occ, mode_s.c_str(), jobs, tk, R, steps, b, ctx0, dtok, mode == 0 ? 0 : infer_sms);
 
-  Ctx C; memset(&C, 0, sizeof C); C.mode = mode; C.infer_sms = infer_sms; C.lend = mode == 2 && lend; C.lent = dalloc<unsigned>(1); C.smid_rank = d_rank; C.finished = dalloc<int>(1);
+  Ctx C; memset(&C, 0, sizeof C); C.mode = mode == 2 && split_s == "dynamic" ? 3 : mode; C.infer_sms = infer_sms; C.lend = mode == 2 && lend; C.lent = dalloc<unsigned>(1); C.smid_rank = d_rank; C.finished = dalloc<int>(1);
+  C.t0 = dalloc<u64>(1); C.max_ns = (u64)(max_s * 1e9); C.tmax = dalloc<u64>(32); C.L = rate > 0 ? Lr : 0;
+  if (rate > 0) { std::vector<u64> arr(nreq); std::mt19937_64 g(seed * 7 + 11); std::exponential_distribution<double> ex(rate); double t = 0.02;
+    for (int k = 0; k < nreq; k++) { t += ex(g); arr[k] = (u64)(t * 1e9); }
+    u64* a = dalloc<u64>(nreq); CK(cudaMemcpy(a, arr.data(), nreq * 8, cudaMemcpyHostToDevice)); C.arr = a; }
   C.jobs = jobs; C.tk = tk; C.nx = nx; C.scale = 2.f; C.lr = 1e-3f; C.b1 = 0.9f; C.b2 = 0.999f; C.eps = 1e-8f; C.inv = 1.f / ((float)tk * NQV); C.b = b; C.ctx0 = ctx0;
   auto fb = [&](size_t n, u64 s, float sc) { bf16* p = dalloc<bf16>(n); fill_bf16<<<1024, 256>>>(p, n, seed * 131 + s, sc); return p; };
   auto ff = [&](size_t n, u64 s, float sc) { float* p = dalloc<float>(n); fill_f32<<<1024, 256>>>(p, n, seed * 131 + s, sc); return p; };
@@ -437,7 +508,9 @@ int main(int argc, char** argv) {
   constexpr int TI = 9728;                                   // Qwen3-4B MLP width: trunk layer = frozen up [TI][D] then down [D][TI] GEMM
   C.lt = lt; const bf16* Wup = lt ? fb((size_t)lt * TI * D, 40, 1.7320508f / sqrtf((float)D)) : nullptr;
   const bf16* Wdn = lt ? fb((size_t)lt * D * TI, 41, 1.7320508f / sqrtf((float)TI)) : nullptr;
-  if (lt) { C.Xt[0] = dalloc<bf16>((size_t)tk * D); C.Xt[1] = dalloc<bf16>((size_t)tk * D); C.Ht = dalloc<bf16>((size_t)tk * TI); C.junk = dalloc<bf16>((size_t)tk * TI); }
+  if (lt) { C.Xt[0] = dalloc<bf16>((size_t)tk * D); C.Xt[1] = dalloc<bf16>((size_t)tk * D); C.Ht = dalloc<bf16>((size_t)tk * TI); C.junk = reinterpret_cast<bf16*>(dalloc<float>((size_t)tk * TI)); }
+  if (kc && (kc % 64 || D % kc || TI % kc)) { fprintf(stderr, "--trunk-kchunk must be a multiple of 64 dividing %d and %d\n", D, TI); return 2; }
+  float* Cf = lt && kc ? dalloc<float>((size_t)tk * TI) : nullptr;
   C.P = dalloc<float>((size_t)jobs * PJ);
   for (int j = 0; j < jobs; j++) fill_f32<<<256, 256>>>(C.P + (size_t)j * PJ, 2 * R * D, seed * 977 + jb + j, 1.7320508f / sqrtf((float)D));   // A random, B zero (LoRA init)
   C.G = dalloc<float>((size_t)jobs * PJ); C.M = dalloc<float>((size_t)jobs * PJ); C.Vm = dalloc<float>((size_t)jobs * PJ);
@@ -472,21 +545,30 @@ int main(int argc, char** argv) {
 #else
   printf("gemm_backend mma_sync\n");
 #endif
-  const int T0 = 2 * lt, ADAM = T0 + 7, LOSS = T0 + 8, reps = trunk_s == "perjob" ? jobs : 1;
+  const int KS1 = kc && D > kc ? D / kc : 1, KS2 = kc && TI > kc ? TI / kc : 1;   // split-K chunks (up K=D, down K=TI): bounds trunk tile time
+  const int T0 = lt * ((KS1 > 1 ? KS1 + 1 : 1) + (KS2 > 1 ? KS2 + 1 : 1)), ADAM = T0 + 7, LOSS = T0 + 8, reps = trunk_s == "perjob" ? jobs : 1;
+  int prev = -1;
+  auto dep_prev = [&](const Ph& t) { prev = prev < 0 ? Bt.add(t, {make_int2(ADAM, -1)}) : Bt.add(t, {make_int2(prev, 0)}); };
   for (int l = 0; l < lt; l++) for (int k = 0; k < 2; k++) {   // trunk phases first: tickets are claimed in phase order
-    Ph t = mk(k ? T_TDN : T_TUP, 0); t.layer = l; t.reps = reps; const int n = k ? D : TI, kk = k ? TI : D;
-    t.ga.A = k ? C.Ht : (l ? C.Xt[l % 2] : C.X); t.ga.B = k ? Wdn + (size_t)l * D * TI : Wup + (size_t)l * TI * D;
-    t.ga.C = k ? (void*)C.Xt[(l + 1) % 2] : (void*)C.Ht;
-    t.ga.lda = kk; t.ga.ldb = kk; t.ga.ldc = n; t.ga.ldaux = 8; t.ga.M = tk; t.ga.N = n; t.ga.K = kk; t.tilesM = tk / 128; t.ntasks = reps * (tk / 128) * (n / 128);
-    if (!gemm::args_ok(t.ga)) { fprintf(stderr, "bad trunk GEMM args\n"); return 2; }
+    const int n = k ? D : TI, kk = k ? TI : D, ks = k ? KS2 : KS1, kcs = kk / ks;
+    const bf16* A = k ? C.Ht : (l ? C.Xt[l % 2] : C.X); const bf16* Bw = k ? Wdn + (size_t)l * D * TI : Wup + (size_t)l * TI * D;
+    bf16* Cb = k ? C.Xt[(l + 1) % 2] : C.Ht;
+    for (int c = 0; c < ks; c++) {   // chunk c accumulates into Cf after chunk c-1 (fixed order: deterministic)
+      Ph t = mk(k ? T_TDN : T_TUP, 0); t.layer = l; t.reps = reps; t.f32 = ks > 1; t.koff = c * kcs;
+      t.ga.A = A + (size_t)c * kcs; t.ga.B = Bw + (size_t)c * kcs; t.ga.C = ks > 1 ? (void*)Cf : (void*)Cb; t.ga.accumulate = c > 0;
+      t.ga.lda = kk; t.ga.ldb = kk; t.ga.ldc = n; t.ga.ldaux = 8; t.ga.M = tk; t.ga.N = n; t.ga.K = kcs; t.tilesM = tk / 128; t.ntasks = reps * (tk / 128) * (n / 128);
+      if (!gemm::args_ok(t.ga)) { fprintf(stderr, "bad trunk GEMM args\n"); return 2; }
 #ifdef MW_GEMM_WG
-    { const int nm = (!k && !l) ? nx : 1; std::vector<const CUtensorMap*> maps(nm);
-      for (int x = 0; x < nm; x++) maps[x] = gemm::sm90::make_map((const bf16*)t.ga.A + (size_t)x * tk * D, kk, tk, kk, 64, 128);
-      const CUtensorMap** dm; CK(cudaMalloc(&dm, nm * sizeof(void*))); CK(cudaMemcpy(dm, maps.data(), nm * sizeof(void*), cudaMemcpyHostToDevice));
-      t.tmAx = dm; t.tmB = gemm::sm90::make_map(t.ga.B, kk, n, kk, 64, 128); }
+      { const int nm = (!k && !l) ? nx : 1; std::vector<const CUtensorMap*> maps(nm);
+        for (int x = 0; x < nm; x++) maps[x] = gemm::sm90::make_map((const bf16*)t.ga.A + (size_t)x * tk * D, kcs, tk, kk, 64, 128);
+        const CUtensorMap** dm; CK(cudaMalloc(&dm, nm * sizeof(void*))); CK(cudaMemcpy(dm, maps.data(), nm * sizeof(void*), cudaMemcpyHostToDevice));
+        t.tmAx = dm; t.tmB = gemm::sm90::make_map(t.ga.B, kcs, n, kk, 64, 128); }
 #endif
-    if (k) Bt.add(t, {make_int2(2 * l, 0)}); else if (l) Bt.add(t, {make_int2(2 * l - 1, 0)}); else Bt.add(t, {make_int2(ADAM, -1)});
+      dep_prev(t);
+    }
+    if (ks > 1) { Ph t = mk(T_TCV, tk * n / (THREADS * 8)); t.reps = 1; t.ga.A = reinterpret_cast<const bf16*>(Cf); t.ga.C = Cb; dep_prev(t); }
   }
+  if (prev != T0 - 1) { fprintf(stderr, "trunk phase count mismatch\n"); return 2; }
   if (lt) { Bt.add(q, {make_int2(LOSS, -1), make_int2(T0 - 1, 0)}); Bt.add(v, {make_int2(LOSS, -1), make_int2(T0 - 1, 0)});
     Bt.add(mk(T_DOWN, rbt), {make_int2(ADAM, -1), make_int2(T0 - 1, 0)}); }
   else { Bt.add(q, {make_int2(LOSS, -1)}); Bt.add(v, {make_int2(LOSS, -1)}); Bt.add(mk(T_DOWN, rbt), {make_int2(ADAM, -1)}); }
@@ -496,7 +578,7 @@ int main(int argc, char** argv) {
   Bt.add(mk(T_DA, jobs * (D / THREADS)), {make_int2(T0 + 5, 0)});
   Bt.add(mk(T_ADAM, jobs * (PJ / (THREADS * 4))), {make_int2(T0 + 4, 0), make_int2(T0 + 6, 0)});
   Bt.add(mk(T_LOSS, 1), {make_int2(T0 + 3, 0)});
-  printf("trunk: %d frozen layers (%s), job-base %d, kernel launches 1 for %d steps\n", lt, trunk_s.c_str(), jb, steps);
+  printf("trunk: %d frozen layers (%s, k-chunk %d), job-base %d, sm-split %s, kernel launches 1 for %d steps\n", lt, trunk_s.c_str(), kc, jb, split_s.c_str(), steps);
   upload(Bt, mode == 1 ? 0 : steps, ADAM, C.tr);
   // decode graph (per token)
   Builder Bd;
@@ -514,23 +596,24 @@ int main(int argc, char** argv) {
   if (mode != 1) {
     std::vector<u64> sd(steps); CK(cudaMemcpy(sd.data(), C.step_done, steps * 8, cudaMemcpyDeviceToHost));
     std::vector<float> loss((size_t)steps * jobs); CK(cudaMemcpy(loss.data(), C.loss, loss.size() * 4, cudaMemcpyDeviceToHost));
-    const int w0 = std::min(steps - 1, 3); tr_lo = sd[w0]; tr_hi = sd[steps - 1];
-    const double span = (tr_hi - tr_lo) * 1e-9; const int n = steps - 1 - w0;
-    printf("loss job0: step0 %.6f last %.6f\n", loss[0], loss[(size_t)(steps - 1) * jobs]);
+    int sdone = 0; while (sdone < steps && sd[sdone]) sdone++;   // early stop: --max-seconds or last decode request done
+    const int w0 = std::min(std::max(sdone - 1, 0), 3); tr_lo = sdone ? sd[w0] : 0; tr_hi = sdone ? sd[sdone - 1] : 0;
+    const double span = (tr_hi - tr_lo) * 1e-9; const int n = sdone - 1 - w0;
+    printf("loss job0: step0 %.6f last %.6f (%d steps done)\n", loss[0], loss[(size_t)std::max(sdone - 1, 0) * jobs], sdone);
     if (n > 0) printf("train: steady %.4f ms/step -> %.2f steps/s (%d jobs x %d tokens: %.0f job-tok/s)\n", span * 1e3 / n, n / span, jobs, tk, (double)n * jobs * tk / span);
-    dump(dir, "loss.f32", C.loss, (size_t)steps * jobs); dump(dir, "step_done.u64", C.step_done, (size_t)steps); dump(dir, "P.f32", C.P, (size_t)jobs * PJ); dump(dir, "G.f32", C.G, (size_t)jobs * PJ);
+    dump(dir, "loss.f32", C.loss, (size_t)steps * jobs); dump(dir, "step_done.u64", C.step_done, (size_t)steps); dump(dir, "P.f32", C.P, (size_t)jobs * PJ); dump(dir, "G.f32", C.G, (size_t)jobs * PJ); dump(dir, "tmax.u64", C.tmax, 32);
   }
   if (mode != 0) {
     std::vector<u64> td(dtok); CK(cudaMemcpy(td.data(), C.tok_done, dtok * 8, cudaMemcpyDeviceToHost));
     int done = 0; while (done < dtok && td[done]) done++;
     std::vector<double> lat; int inwin = 0; u64 lo = 0, hi = 0;
     for (int t = 1; t < done; t++) {
-      if (mode == 2 && (td[t] < tr_lo || td[t] > tr_hi)) continue;
+      if ((mode == 2 && (td[t] < tr_lo || td[t] > tr_hi)) || (rate > 0 && t % Lr == 0)) continue;   // request mode: TPOT excludes queueing before a first token
       lat.push_back((td[t] - td[t - 1]) * 1e-6); if (!inwin) lo = td[t - 1]; hi = td[t]; inwin++;
     }
     double p50, p99; pct(lat, p50, p99); const double win = (hi - lo) * 1e-9;
     printf("decode: b=%d, %d token steps (%d in window %.3f s) -> %.1f tok/s, tpot p50 %.4f ms p99 %.4f ms\n", b, done, inwin, win, inwin * b / (win + 1e-12), p50, p99);
-    if (!dir.empty()) { dump(dir, "toks.i32", C.toks, (size_t)done * MAXB); dump(dir, "tok_done.u64", C.tok_done, (size_t)done); dump(dir, "lsum.f32", C.lsum, (size_t)done * MAXB); dump(dir, "logits0.f32", C.logits0, (size_t)b * VOC); }
+    if (!dir.empty()) { dump(dir, "toks.i32", C.toks, (size_t)done * MAXB); dump(dir, "tok_done.u64", C.tok_done, (size_t)done); if (C.arr) { dump(dir, "arr.u64", const_cast<u64*>(C.arr), (size_t)nreq); dump(dir, "t0.u64", C.t0, 1); } dump(dir, "lsum.f32", C.lsum, (size_t)done * MAXB); dump(dir, "logits0.f32", C.logits0, (size_t)b * VOC); }
   }
   return 0;
 }

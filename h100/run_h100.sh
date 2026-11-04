@@ -253,5 +253,28 @@ if has trunk; then
   done
 fi
 has score_trunk && python3 "$ROOT/h100/trunk_score.py" "$OUT"
+
+# ---- --sm-split dynamic (strict-priority decode, in-kernel queues) vs static 33 SMs vs stock MPS; seeded Poisson request arrivals ----
+DYR=${DYN_RATES:-2 4 8 16}; DYJ=${DYN_JOBS:-16}; DYK=${TRUNK_KCHUNK:-512}; DYQ=${DYN_NREQ:-64}; DYL=${DYN_REQ_TOKENS:-64}; DYS=${DYN_STEPS:-200000}
+if has dyn; then
+  dyd() { mkdir -p "$OUT/dyn/$1"; local n=$1; shift; dk $PT_IMG dyn_$n.log "$@"; }
+  TK="--trunk-layers $TRL --trunk-kchunk $DYK"; echo "$DYL" > "$OUT/dyn_req_tokens"
+  for J in $(seq 0 $((DYJ - 1))); do dyd solo16_j$J -- "timeout -k 10 600 $TR --mode train --jobs 1 --job-base $J $TK --steps 16 --dump /out/dyn/solo16_j$J"; done
+  dcgm_on dyn_solo_j0; dyd solo_j0 -- "timeout -k 10 900 $TR --mode train --jobs 1 $TK --steps $TRS --dump /out/dyn/solo_j0"; dcgm_off
+  dcgm_on dyn_train; dyd train -- "timeout -k 10 900 $TR --mode train --jobs $DYJ $TK --steps $TRS --dump /out/dyn/train"; dcgm_off
+  for B in $TRB; do for R in $DYR; do
+    Q="--b $B --rate $R --nreq $DYQ --req-tokens $DYL"; X=b${B}_r$R; MS=$(python3 -c "print($DYQ / $R + 2)")
+    dcgm_on dyn_dec_$X; dyd dec_$X -- "timeout -k 10 900 $TR --mode dec $Q --dump /out/dyn/dec_$X"; dcgm_off
+    for S in static dynamic; do
+      dcgm_on dyn_${S}_$X; dyd ${S}_$X -- "timeout -k 10 1200 $TR --mode co --sm-split $S --jobs $DYJ $TK $Q --steps $DYS --infer-sms $MWI --dump /out/dyn/${S}_$X"; dcgm_off
+    done
+    mps_start; dcgm_on dyn_mps_$X
+    dyd mps_train_$X "${MPS_ENV[@]}" -e CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$MW_TRAIN_PCT -- "timeout -k 10 1200 $TR --mode train --jobs $DYJ $TK --steps $DYS --max-seconds $MS --dump /out/dyn/mps_train_$X" & tp=$!
+    sleep 3
+    dyd mps_dec_$X "${MPS_ENV[@]}" -e CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$MW_INFER_PCT -- "timeout -k 10 900 $TR --mode dec $Q --dump /out/dyn/mps_dec_$X"
+    wait $tp; dcgm_off; mps_stop
+  done; done
+fi
+has score_dyn && python3 "$ROOT/h100/dyn_score.py" "$OUT"
 has score && python3 "$ROOT/h100/score.py" "$OUT" ${COSCHED_SUMMARY:+--cosched-summary "$COSCHED_SUMMARY"}
 echo "artifacts: $OUT"
