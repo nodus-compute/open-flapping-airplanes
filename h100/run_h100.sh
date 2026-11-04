@@ -8,7 +8,7 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd); GPU=${GPU:-0}; STEPS=${STEPS:-4000}; SUDO=${SUDO-sudo}
 OUT=$(realpath -m "${OUT:-$ROOT/h100/results/run_$(date +%Y%m%d_%H%M%S)}"); DATA=$(realpath -m "${DATA:-$HOME/ofa_data}")
 MPSDIR=/tmp/ofa_mps_$GPU; mkdir -p "$OUT" "$DATA" "$MPSDIR/pipe" "$MPSDIR/log"
-PHASES=${PHASES:-"prep build mk_train mk_split mk_paced mk_dyn pt_full pt_graph serve_full serve_mps mps_pair score"}
+PHASES=${PHASES:-"prep build build_wg gemm_wg mk_train mk_split mk_paced mk_dyn mk_wg pt_full pt_graph serve_full serve_mps mps_pair score"}
 TOTAL=$(nvidia-smi -i "$GPU" --query-gpu=name --format=csv,noheader | grep -q H100 && echo 132 || echo 0)
 [ "$TOTAL" = 132 ] || { echo "GPU $GPU is not an H100"; exit 2; }
 INFER=${INFER_SMS:-21}; TRAIN=$((TOTAL - INFER)); TRAIN_PCT=$(( (100 * TRAIN + TOTAL / 2) / TOTAL )); INFER_PCT=$(( (100 * INFER + TOTAL / 2) / TOTAL ))
@@ -37,6 +37,11 @@ BL=llm/b200/baseline; CK=/root/data/ckpt_pytorch_step$STEPS.pt; HF=/root/data/hf
 has prep && dk $PT_IMG prep.log -- "pip install -q tiktoken numpy && python h100/prep.py"
 # both: -DOFA_GEMM_BACKEND=0 = the mma.sync GEMMs (gemm_backend_r2.cuh defaults to 2, which falls back to mma.sync off sm_100). ofa_h100 = upstream kernel (Nodus code compiled out); ofa_h100_dyn = -DOFA_NODUS_DYN=1 (open-loop demand + lending), used by mk_paced and mk_dyn
 has build && dk $PT_IMG build.log -- "cd llm/b200/megakernel && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100 -DOFA_GEMM_BACKEND=0 && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100_dyn -DOFA_GEMM_BACKEND=0 -DOFA_NODUS_DYN=1"
+# Hopper wgmma + TMA GEMM backend (llm/h100/gemm_sm90.cuh, -DOFA_GEMM_BACKEND=3): gemm_wg checks every model GEMM shape against cuBLAS with upstream's
+# test_gemm_r2.cu first; the mk_wg* arms are skipped unless every shape reports PASS
+has build_wg && dk $PT_IMG build_wg.log -- "cd llm/b200/gemm_tcgen05 && nvcc -arch=sm_90a -O3 -std=c++17 -DOFA_GEMM_BACKEND=3 -o /out/gemm_test_sm90 test_gemm_r2.cu -lcublas && cd ../megakernel && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100_wg -DOFA_GEMM_BACKEND=3 && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100_wg_dyn -DOFA_GEMM_BACKEND=3 -DOFA_NODUS_DYN=1"
+has gemm_wg && dk $PT_IMG gemm_wg.log -- "timeout -k 10 900 /out/gemm_test_sm90 --nopersist"
+WG_OK=0; [ -f "$OUT/gemm_wg.log" ] && grep -q PASS "$OUT/gemm_wg.log" && ! grep -q FAIL "$OUT/gemm_wg.log" && WG_OK=1
 MK=/out/ofa_h100
 has mk_loss20 && dk $PT_IMG mk_loss20.log -- "$MK --steps 20 $BASE --no-doom --loss-out /out/mk_loss20.txt"
 has mk_train && dk $PT_IMG mk_train.log -- "timeout -k 10 1800 $MK $BASE --no-doom --steps $STEPS --loss-out /out/mk_train_loss.txt"
@@ -46,6 +51,13 @@ for R in ${SERVE_RATES:-100 400}; do
   has mk_paced && dk $PT_IMG mk_paced_$R.log -- "timeout -k 10 1800 ${MK}_dyn --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --serve-rate $R --loss-out /out/mk_paced_${R}_loss.txt"
   has mk_dyn && dk $PT_IMG mk_dyn_$R.log -- "timeout -k 10 1800 ${MK}_dyn --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --serve-rate $R --lend --loss-out /out/mk_dyn_${R}_loss.txt"
 done
+if [ "$WG_OK" = 1 ]; then
+  has mk_wg && dk $PT_IMG mk_wg_train.log -- "timeout -k 10 1800 ${MK}_wg $BASE --no-doom --steps $STEPS --loss-out /out/mk_wg_train_loss.txt"
+  has mk_wg && dk $PT_IMG mk_wg_split.log -- "timeout -k 10 1800 ${MK}_wg --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --loss-out /out/mk_wg_split_loss.txt"
+  for R in ${SERVE_RATES:-100 400}; do
+    has mk_wg && dk $PT_IMG mk_wg_dyn_$R.log -- "timeout -k 10 1800 ${MK}_wg_dyn --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --serve-rate $R --lend --loss-out /out/mk_wg_dyn_${R}_loss.txt"
+  done
+elif has mk_wg; then echo "mk_wg skipped: gemm_wg did not PASS every shape (see $OUT/gemm_wg.log)"; fi
 has pt_full && dk $PT_IMG pt_full.log -- "pip install -q tiktoken numpy && cd $BL && python train_pytorch.py --steps $STEPS --out /out/pt_full.json --tag full --save $CK"
 has pt_graph && dk $PT_IMG pt_graph.log -- "pip install -q tiktoken numpy && cd $BL && python train_pytorch.py --cuda_graph --steps $STEPS --out /out/pt_graph.json --tag full"
 if has serve_full || has serve_mps || has mps_pair; then

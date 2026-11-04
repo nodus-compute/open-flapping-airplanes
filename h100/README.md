@@ -24,6 +24,7 @@ Images (pinned): `pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel@sha256:3d614dfd...
 | `pt_full`, `pt_graph` | PyTorch eager / one CUDA graph per step, full GPU, solo. `pt_full` saves the checkpoint vLLM serves |
 | `serve_full`, `serve_mps` | vLLM 0.30 batch-1 decode, 256 tokens, full GPU / MPS 16% |
 | `mps_pair` | FA's baseline style, but MEASURED concurrently: PyTorch CUDA-graph training on MPS 84% plus vLLM on MPS 16%, one host MPS daemon |
+| `build_wg`, `gemm_wg`, `mk_wg` | sm90 wgmma backend build, its GEMM correctness/speed check vs cuBLAS, and the megakernel arms on it (see below) |
 | `score` | `h100/score.py OUT` writes `summary.json` |
 
 Megatron + Transformer Engine needs the TE source build in `llm/b200/baseline/setup_b200.sh` (use `NVTE_CUDA_ARCHS=90`). It is not in the default
@@ -43,6 +44,16 @@ measured from release to completion of each token, using per-token `%globaltimer
 spill stores/loads, the same as unmodified upstream (stack 1496 vs 1456 B). `ofa_h100_dyn`: 128 registers, 308/400 B spills. Lending needs the `mma.sync` backend (`OFA_GEMM_BACKEND=0`, the H100 build).
 Scoring credits open-loop arms with min(served, demand) / solo vLLM. The MPS pair gets the same demand cap: its serving term becomes
 min(vLLM-under-MPS rate, R) / solo. `vs_static_same_demand` = mk_dyn / mk_paced at the same R.
+
+## Improved arm 2: Hopper wgmma + TMA GEMMs (`llm/h100/gemm_sm90.cuh`, `-DOFA_GEMM_BACKEND=3`)
+Upstream has no Hopper GEMM. Its H100 build runs A100-era `mma.sync` GEMMs, while upstream's tcgen05 backend made B200 training about 2x faster
+(95.8 s to 48.1 s). `gemm_sm90.cuh` keeps the task contract: one 128x128 tile per task, all 256 threads, the same layouts and epilogues.
+- Loads: TMA 2D loads with 128B swizzle into a 3-stage mbarrier pipeline (99 KB smem, 2 blocks/SM fit).
+- Math: `wgmma.mma_async m64n128k16` bf16 to fp32, warpgroup 0 on rows 0-63 and warpgroup 1 on rows 64-127.
+- Descriptor strides: copied from upstream's B300-verified tcgen05 kit.
+- Gate: phase `gemm_wg` runs upstream's `test_gemm_r2.cu` (all 15 model GEMM shapes vs an fp32 reference and cuBLAS, plus timing vs cuBLAS) on the
+  sm90 backend. The `mk_wg_*` arms (training only, static split, dynamic split) run only if every shape PASSes.
+- Status: compiled with nvcc 12.8 for sm_90a but never executed, so expect the first GPU run to find descriptor or layout bugs.
 
 ## Score and gates (pre-registered, `score.py GATES`)
 U = training tok/s / best solo full-GPU training tok/s (max of mk_train, pt_full, pt_graph, te_graph), plus serving tok/s / solo full-GPU vLLM tok/s.

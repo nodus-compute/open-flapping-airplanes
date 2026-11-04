@@ -809,8 +809,8 @@ int main(int argc, char** argv) {
 #if !OFA_NODUS_DYN
   if (serve_rate > 0 || lend) { fprintf(stderr, "--serve-rate/--lend need a -DOFA_NODUS_DYN=1 build\n"); return 2; }
 #endif
-#if OFA_GEMM_BACKEND != 0
-  if (C.lend) { printf("warning: --lend needs the mma.sync GEMM backend (OFA_GEMM_BACKEND=0); lending disabled\n"); C.lend = 0; }
+#if OFA_GEMM_BACKEND != 0 && OFA_GEMM_BACKEND != 3
+  if (C.lend) { printf("warning: --lend needs the mma.sync or sm90 GEMM backend (OFA_GEMM_BACKEND=0 or 3); lending disabled\n"); C.lend = 0; }
 #endif
   if (serve_rate > 0 || lend) printf("serving demand: %s, lending %s\n", serve_rate > 0 ? "open-loop paced" : "closed loop", C.lend ? "on" : "off");
   CK(cudaDeviceSynchronize());

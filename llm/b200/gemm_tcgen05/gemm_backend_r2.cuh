@@ -7,7 +7,22 @@
 #ifndef OFA_GEMM_BACKEND
 #define OFA_GEMM_BACKEND 2
 #endif
-#if OFA_GEMM_BACKEND == 2
+#if OFA_GEMM_BACKEND == 3
+// Nodus fork: Hopper wgmma + TMA backend (llm/h100/gemm_sm90.cuh); one task = one 128x128 tile like the mma.sync backend
+#include "../../h100/gemm_sm90.cuh"
+namespace tg {
+using Args = gemm::sm90::ArgsWG;
+constexpr bool RAW_TASK = false;
+inline bool args_ok(const Args& p) { return gemm::sm90::args_ok(p); }
+inline void prepare(Args& p, int layout, int = 0, int = 1) { gemm::sm90::prepare(p, layout); }
+inline void choose(int, int, int, int* wide, int* nsub, int = -1, int = 0) { *wide = 0; *nsub = 1; }
+inline int ntasks(const Args& p) { return (p.M / 128) * (p.N / 128); }
+__host__ __device__ constexpr int smem_bytes() { return gemm::sm90::smem_bytes(); }
+template <int L, int E> __device__ __forceinline__ void tile(const Args& p, int tm, int tn, char* smem) { gemm::sm90::tile<L, E>(p, tm, tn, smem); }
+__device__ __forceinline__ void block_begin() {}
+__device__ __forceinline__ void block_end() {}
+}  // namespace tg
+#elif OFA_GEMM_BACKEND == 2
 #include "gemm_sm100_v2.cuh"
 namespace tg {
 using Args = gemm::sm100v2::ArgsTC;
