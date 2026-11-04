@@ -37,7 +37,7 @@ struct Job {
   int* done; unsigned* ticket;
 };
 struct Ctx {
-  Job tr, dc; int mode, infer_sms; const int* smid_rank; int* finished;
+  Job tr, dc; int mode, infer_sms, lend; unsigned* lent; const int* smid_rank; int* finished;
   // train
   int jobs, tk, nx; float scale, lr, b1, b2, eps, inv;
   const bf16 *X, *Wq, *Wv, *Tq, *Tv; bf16 *Yq, *Yv;
@@ -238,17 +238,51 @@ __device__ void decode_task(const Ctx& C, const Ph& d, int local, int step, char
   }
 }
 
+__device__ __forceinline__ void finish_train(const Ctx& C, const Job& J, int ph, int step) {
+  const int old = atomicAdd(J.done + ph, 1);
+  if (ph == J.last_ph && old == J.ntasks[ph] * (step + 1) - 1) {
+    C.step_done[step] = gtimer(); if (step == J.limit - 1) { __threadfence(); *reinterpret_cast<volatile int*>(C.finished) = 1; } }
+}
+// --lend: a decode block whose next decode task is not ready runs ONE training task, but only one whose dependencies are already met
+// (peek the ticket, check deps, CAS-claim exactly it), so lending never waits on training.
+__device__ bool try_lend(const Ctx& C, char* smem) {
+  __shared__ volatile int s_l[4];
+  const Job& J = C.tr;
+  if (threadIdx.x == 0) {
+    int ok = 0, step = 0, ph = 0, local = 0;
+    const unsigned g = *reinterpret_cast<volatile unsigned*>(J.ticket);
+    if (g < (unsigned)J.limit * (unsigned)J.tps) {
+      step = (int)(g / (unsigned)J.tps); const int r = (int)(g - (unsigned)step * (unsigned)J.tps);
+      while (r >= J.prefix[ph + 1]) ph++;
+      local = r - J.prefix[ph]; bool ready = true;
+      for (int k = 0; k < J.dep_cnt[ph] && ready; k++) { const int2 e = J.deps[J.dep_off[ph] + k]; const int need = J.ntasks[e.x] * (step + 1 + e.y);
+        if (need > 0 && ld_acq(J.done + e.x) < need) ready = false; }
+      if (ready && atomicCAS(J.ticket, g, g + 1) == g) ok = 1;
+    }
+    s_l[0] = ok; s_l[1] = step; s_l[2] = ph; s_l[3] = local;
+  }
+  __syncthreads();
+  const int ok = s_l[0], step = s_l[1], ph = s_l[2], local = s_l[3];
+  __syncthreads();
+  if (!ok) return false;
+  train_task(C, J.ph[ph], local, step, smem);
+  __threadfence(); __syncthreads();
+  if (threadIdx.x == 0) { finish_train(C, J, ph, step); atomicAdd(C.lent, 1u); }
+  __syncthreads();
+  return true;
+}
+
 // ------------------------------------------------------------------------------------------------ persistent loop (OFA fetch-add ticket claim)
 __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
   __shared__ volatile int s_sel[4];
-  const int tid = threadIdx.x; int cph = 0, rstep = -1, rph = -1;
+  const int tid = threadIdx.x; int cph = 0, rstep = -1, rph = -1, pend = 0; unsigned pend_g = 0;
   const unsigned total = (unsigned)J.limit * (unsigned)J.tps;
   for (;;) {
     if (tid == 0) {
       int res = 0, step = 0, ph = 0, local = 0;
       if (job_id == 1 && C.mode == 2 && ld_vol(C.finished)) res = -2;
       else {
-        const unsigned g = atomicAdd(J.ticket, 1u);
+        unsigned g; if (pend) { g = pend_g; pend = 0; } else g = atomicAdd(J.ticket, 1u);
         if (g >= total) res = -2;
         else {
           step = (int)(g / (unsigned)J.tps); const int r = (int)(g - (unsigned)step * (unsigned)J.tps);
@@ -264,6 +298,7 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
               }
               if (ready) { rstep = step; rph = ph; break; }
               if (job_id == 1 && C.mode == 2 && ld_vol(C.finished)) { res = -2; break; }
+              if (job_id == 1 && C.lend) { pend = 1; pend_g = g; res = -3; break; }
               __nanosleep(64);
             }
           }
@@ -274,17 +309,14 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
     __syncthreads();
     const int res = s_sel[0], step = s_sel[1], ph = s_sel[2], local = s_sel[3];
     __syncthreads();
+    if (res == -3) { if (!try_lend(C, smem) && tid == 0) __nanosleep(64); continue; }
     if (res < 0) break;
     if (job_id == 0) train_task(C, J.ph[ph], local, step, smem); else decode_task(C, J.ph[ph], local, step, smem);
     __threadfence();
     __syncthreads();
     if (tid == 0) {
-      const int old = atomicAdd(J.done + ph, 1);
-      if (ph == J.last_ph && old == J.ntasks[ph] * (step + 1) - 1) {
-        const u64 t1 = gtimer();
-        if (job_id == 0) { C.step_done[step] = t1; if (step == J.limit - 1) { __threadfence(); *reinterpret_cast<volatile int*>(C.finished) = 1; } }
-        else C.tok_done[step] = t1;
-      }
+      if (job_id == 0) finish_train(C, J, ph, step);
+      else { const int old = atomicAdd(J.done + ph, 1); if (ph == J.last_ph && old == J.ntasks[ph] * (step + 1) - 1) C.tok_done[step] = gtimer(); }
     }
   }
 }
@@ -331,13 +363,13 @@ template <class X> static void dump(const std::string& dir, const char* name, co
 static void pct(std::vector<double> v, double& p50, double& p99) { if (v.empty()) { p50 = p99 = 0; return; } std::sort(v.begin(), v.end()); p50 = v[v.size() / 2]; p99 = v[std::min(v.size() - 1, (size_t)(v.size() * 0.99))]; }
 
 int main(int argc, char** argv) {
-  std::string mode_s = "co", dir; int jobs = 16, tk = 512, steps = 16, b = 1, ctx0 = 1024, dtok = 2048, infer_sms = 33, nx = 4; u64 seed = 1234;
+  std::string mode_s = "co", dir; int jobs = 16, tk = 512, steps = 16, b = 1, ctx0 = 1024, dtok = 2048, infer_sms = 33, nx = 4, lend = 0; u64 seed = 1234;
   for (int i = 1; i < argc; i++) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s) && i + 1 < argc; };
     if (is("--mode")) mode_s = argv[++i]; else if (is("--jobs")) jobs = atoi(argv[++i]); else if (is("--tokens")) tk = atoi(argv[++i]);
     else if (is("--steps")) steps = atoi(argv[++i]); else if (is("--b")) b = atoi(argv[++i]); else if (is("--ctx")) ctx0 = atoi(argv[++i]);
     else if (is("--dec-tokens")) dtok = atoi(argv[++i]); else if (is("--infer-sms")) infer_sms = atoi(argv[++i]); else if (is("--dump")) dir = argv[++i];
-    else if (is("--seed")) seed = atoll(argv[++i]); else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
+    else if (!strcmp(argv[i], "--lend")) lend = 1; else if (is("--seed")) seed = atoll(argv[++i]); else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
   }
   const int mode = mode_s == "train" ? 0 : mode_s == "dec" ? 1 : mode_s == "co" ? 2 : -1;
   if (mode < 0 || jobs < 1 || jobs > THREADS || tk % 128 || b < 1 || b > MAXB || ctx0 < 1 || steps < 1 || (mode != 0 && ctx0 + dtok > MAXPOS)) {
@@ -358,7 +390,7 @@ int main(int argc, char** argv) {
   printf("GPU %s, %d SMs, %d blocks (%d/SM); mode %s; train jobs %d x %d tokens, q/v rank %d, %d steps; decode b=%d ctx %d, %d tokens, infer SMs %d\n",
          prop.name, nsm, nblocks, occ, mode_s.c_str(), jobs, tk, R, steps, b, ctx0, dtok, mode == 0 ? 0 : infer_sms);
 
-  Ctx C; memset(&C, 0, sizeof C); C.mode = mode; C.infer_sms = infer_sms; C.smid_rank = d_rank; C.finished = dalloc<int>(1);
+  Ctx C; memset(&C, 0, sizeof C); C.mode = mode; C.infer_sms = infer_sms; C.lend = mode == 2 && lend; C.lent = dalloc<unsigned>(1); C.smid_rank = d_rank; C.finished = dalloc<int>(1);
   C.jobs = jobs; C.tk = tk; C.nx = nx; C.scale = 2.f; C.lr = 1e-3f; C.b1 = 0.9f; C.b2 = 0.999f; C.eps = 1e-8f; C.inv = 1.f / ((float)tk * NQV); C.b = b; C.ctx0 = ctx0;
   auto fb = [&](size_t n, u64 s, float sc) { bf16* p = dalloc<bf16>(n); fill_bf16<<<1024, 256>>>(p, n, seed * 131 + s, sc); return p; };
   auto ff = [&](size_t n, u64 s, float sc) { float* p = dalloc<float>(n); fill_f32<<<1024, 256>>>(p, n, seed * 131 + s, sc); return p; };
@@ -414,7 +446,7 @@ int main(int argc, char** argv) {
 
   cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
   CK(cudaEventRecord(e0)); mw_kernel<<<nblocks, THREADS, SMEM>>>(C); CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
-  float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); printf("kernel %.3f s\n", ms / 1e3);
+  float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); unsigned lent = 0; CK(cudaMemcpy(&lent, C.lent, 4, cudaMemcpyDeviceToHost)); printf("kernel %.3f s, lending %s, lent train tasks %u\n", ms / 1e3, C.lend ? "on" : "off", lent);
 
   u64 tr_lo = 0, tr_hi = 0;
   if (mode != 1) {

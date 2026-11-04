@@ -66,7 +66,7 @@ def main(out):
         solo = dec_stats(arr(bdir / "tok_done.u64", "Q"), b)
         part = dec_stats(arr(mw / f"dec_part_b{b}" / "tok_done.u64", "Q"), b)
         row = {"solo_dec_full": solo, "solo_dec_partition": part}
-        for arm, tdir, ddir in (("co", f"co_b{b}", f"co_b{b}"), ("mps", f"mps_train_b{b}", f"mps_dec_b{b}")):
+        for arm, tdir, ddir in (("co", f"co_b{b}", f"co_b{b}"), ("lend", f"lend_b{b}", f"lend_b{b}"), ("mps", f"mps_train_b{b}", f"mps_dec_b{b}")):
             sd, td = arr(mw / tdir / "step_done.u64", "Q"), arr(mw / ddir / "tok_done.u64", "Q")
             lo, hi = overlap(sd, td)
             tr = train_rate(sd, lo, hi) if lo is not None else None
@@ -77,6 +77,8 @@ def main(out):
         co16 = mw / f"co16_b{b}"
         gates = {
             "train_bitwise_vs_solo_16": same_bytes(mw / "train16", co16, ["loss.f32", "P.f32", "G.f32"]),
+            "lend_train_bitwise_vs_solo_16": same_bytes(mw / "train16", mw / f"lend16_b{b}", ["loss.f32", "P.f32", "G.f32"]),
+            "lend_decode_bitwise_vs_offline": same_bytes(bdir, mw / f"lend_b{b}", ["logits0.f32"]) and same_prefix(bdir, mw / f"lend_b{b}", "toks.i32", 4),
             "decode_logits_bitwise_vs_offline": same_bytes(bdir, co16, ["logits0.f32"]) and same_bytes(bdir, mw / f"co_b{b}", ["logits0.f32"]),
             "decode_tokens_bitwise_vs_offline": all(same_prefix(bdir, mw / d, n, 4) for d in (f"co16_b{b}", f"co_b{b}") for n in ("toks.i32", "lsum.f32")),
             "pytorch_tolerance": bool(ref.get("pass")),
@@ -84,6 +86,10 @@ def main(out):
         cp, sp = row["co"]["tpot_p99_ms"], solo["tpot_p99_ms"]
         row["p99_vs_solo"] = cp / sp if cp and sp else None
         gates["decode_p99_within_1.10x_solo"] = row["p99_vs_solo"] is not None and row["p99_vs_solo"] <= P99_MAX
+        lp = row["lend"]["tpot_p99_ms"]
+        row["lend_p99_vs_solo"] = lp / sp if lp and sp else None
+        lu, mu2 = row["lend"]["combined_U"], row["mps"]["combined_U"]
+        row["lend_vs_mps_U"] = lu / mu2 if lu and mu2 else None
         cu, mu = row["co"]["combined_U"], row["mps"]["combined_U"]
         row["co_vs_mps_U"] = cu / mu if cu and mu else None
         row["gates"] = gates

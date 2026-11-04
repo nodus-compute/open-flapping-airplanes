@@ -109,6 +109,8 @@ if has mw; then
     mwd dec_part_b$B -- "timeout -k 10 900 $MW --mode dec --b $B --dec-tokens $MWT --infer-sms $MWI --dump /out/mw/dec_part_b$B"
     mwd co16_b$B -- "timeout -k 10 900 $MW --mode co --b $B --steps 16 --dec-tokens $MWT --infer-sms $MWI --dump /out/mw/co16_b$B"
     mwd co_b$B -- "timeout -k 10 900 $MW --mode co --b $B --steps $MWS --dec-tokens $MWT --infer-sms $MWI --dump /out/mw/co_b$B"
+    mwd lend16_b$B -- "timeout -k 10 900 $MW --mode co --lend --b $B --steps 16 --dec-tokens $MWT --infer-sms $MWI --dump /out/mw/lend16_b$B"
+    mwd lend_b$B -- "timeout -k 10 900 $MW --mode co --lend --b $B --steps $MWS --dec-tokens $MWT --infer-sms $MWI --dump /out/mw/lend_b$B"
     mps_start
     mwd mps_train_b$B "${MPS_ENV[@]}" -e CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$MW_TRAIN_PCT -- "timeout -k 10 900 $MW --mode train --steps $MWS --dump /out/mw/mps_train_b$B" & tp=$!
     sleep 3
