@@ -1,0 +1,20 @@
+{
+ "id": "ofa-stage-offline-pcie-23c7bbd951c7",
+ "priority": 80,
+ "repo_sha": "23c7bbd951c7c57094037cae263aabfa19dd2954",
+ "cwd": "/home/ubuntu/ofa-23c7bbd951c7",
+ "out": "/home/ubuntu/gpu-queue-runs/ofa-stage-offline-pcie-23c7bbd951c7",
+ "sudo": false,
+ "scope": "host",
+ "requires_free_gpus": 0,
+ "once": true,
+ "min_free_mib": 0,
+ "boxes": [
+  "moeslim"
+ ],
+ "argv": [
+  "bash",
+  "-c",
+  "cd /home/ubuntu/ofa-23c7bbd951c7 && bash h100/stage_offline.sh --sha 23c7bbd951c7c57094037cae263aabfa19dd2954 --py-deps $HOME/ofa_pydeps-tf4.56.2 --data $HOME/ofa_data-staged-pcie-23c7bbd951c7 --marker /home/ubuntu/ofa-runs/stage-offline-pcie-23c7bbd951c7.ready"
+ ]
+}

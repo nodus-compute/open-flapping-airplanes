@@ -1,0 +1,37 @@
+{
+ "id": "ofa-codec-n32-pcie-23c7bbd951c7",
+ "repo": "nodus-compute/open-flapping-airplanes",
+ "repo_sha": "23c7bbd951c7c57094037cae263aabfa19dd2954",
+ "branch": "devin/1793766400-h100-repro",
+ "gpus": 1,
+ "priority": 76,
+ "cwd": "/home/ubuntu/ofa-23c7bbd951c7",
+ "out": "/home/ubuntu/gpu-queue-runs/ofa-codec-n32-pcie-23c7bbd951c7",
+ "once": true,
+ "requires_free_gpus": 1,
+ "min_free_mib": 70000,
+ "boxes": [
+  "moeslim"
+ ],
+ "require_gpu_name": "H100 PCIe",
+ "min_driver_major": 580,
+ "sudo": false,
+ "requires_paths": [
+  "/home/ubuntu/ofa-runs/stage-offline-pcie-23c7bbd951c7.ready",
+  "/home/ubuntu/ofa-runs/sxm5-mirror/codec-n32-ts-9873b7990eec/codec_verify.json"
+ ],
+ "argv": [
+  "bash",
+  "-c",
+  "cd /home/ubuntu/ofa-23c7bbd951c7 && python3 -c \"import json,sys; j=json.load(open(sys.argv[1])); sys.exit(0 if j.get('passed') and j.get('failed') == [] else 1)\" /home/ubuntu/ofa-runs/sxm5-mirror/codec-n32-ts-9873b7990eec/codec_verify.json || exit 8 && O=$HOME/ofa-runs/codec-n32-pcie-23c7bbd951c7-$(date -u +%Y%m%dT%H%M%SZ) && (GEMM=mma GPU={gpus} ALLOW_GPU0=$(test -n \"{allow_gpu0}\" && echo 1 || echo 0) GPU_NAME=\"H100 PCIe\" OFFLINE=1 PY_DEPS=$HOME/ofa_pydeps-tf4.56.2 OUT=$O DATA=$HOME/ofa_data-staged-pcie-23c7bbd951c7 TRUNK_CKPT_SUMMARY=$O/trunk_ckpt_summary.json TRAIN_BUBBLE_DATA=$HOME/training-bubble-data PREFLIGHT_DEADLINE_S=60 PREFIX_JOBS=32 TRUNK_CKPT_JOBS=1 TRUNK_CKPT_STEPS=4 CODEC_JOBS=32 CODEC_STEPS=24 CODEC_DEC_TOKENS=2048 CODEC_BATCHES=\"1 8\" CODEC_RESERVE=\"0 16\" CODEC_ATTN_BWD=cuda CODEC_TS=1 PHASES=\"preflight build_trunk trunk_ckpt score_trunk_ckpt codec score_codec\" bash h100/stage_chain.sh --sha 23c7bbd951c7c57094037cae263aabfa19dd2954 --jobs 32 --prefix-run PREFIX_RUN_PATH || true) && python3 h100/codec_verify.py $O > $O/codec_verify.json && (python3 h100/f_split.py $O > $O/f_split.json || true) && printf \"%s\\n\" \"$O\" > /home/ubuntu/ofa-runs/codec-n32-pcie-23c7bbd951c7.passed.tmp.$$ && mv -f /home/ubuntu/ofa-runs/codec-n32-pcie-23c7bbd951c7.passed.tmp.$$ /home/ubuntu/ofa-runs/codec-n32-pcie-23c7bbd951c7.passed"
+ ],
+ "hardware_class": "H100 PCIe (moeslim); own marker, never pooled with SXM5",
+ "prefix_run_arg": "replace PREFIX_RUN_PATH with the audited training_prefix N32 seed-413 top-layers-1 run dir as present on moeslim",
+ "sxm5_gate": "requires_paths are checked on moeslim: copy the SXM5 bundle's codec_verify.json to /home/ubuntu/ofa-runs/sxm5-mirror/codec-n32-ts-9873b7990eec/codec_verify.json after the SXM5 marker exists; the entry re-checks passed:true (exit 8)",
+ "gates": {
+  "scorer": "codec_verify.py exit 0 -> atomic /home/ubuntu/ofa-runs/codec-n32-pcie-23c7bbd951c7.passed; f_split.json report-only",
+  "network": "none at GPU run time",
+  "gpu": "{gpus}/{allow_gpu0}",
+  "preflight": "60 s, gpu_name H100 PCIe, per-GPU-UUID MPS"
+ }
+}
