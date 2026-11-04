@@ -8,8 +8,8 @@ baselines and scores combined useful work per GPU-second. Nothing here has run o
 ## Command (1x H100; needs docker + nvidia-container-toolkit; the vLLM 0.30 image needs driver >= 580)
 ```bash
 git clone -b <branch> https://github.com/nodus-compute/open-flapping-airplanes && cd open-flapping-airplanes
-GPU=0 ./h100/run_h100.sh                                   # everything
-GPU=0 PHASES="prep build mk_loss20 mk_train mk_split score" ./h100/run_h100.sh   # megakernel repro only
+GPU=0 ALLOW_GPU0=1 ./h100/run_h100.sh                      # everything (GPU 0 needs ALLOW_GPU0=1)
+GPU=0 ALLOW_GPU0=1 PHASES="prep build mk_loss20 mk_train mk_split score" ./h100/run_h100.sh   # megakernel repro only
 ```
 Images (pinned): `pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel@sha256:3d614dfd...` builds and runs the megakernel and the PyTorch baselines.
 `vllm/vllm-openai:v0.30.0-x86_64@sha256:5f5e5352...` runs the vLLM baseline. Data (about 1.5 GB) is cached in `$DATA` (default `~/ofa_data`).

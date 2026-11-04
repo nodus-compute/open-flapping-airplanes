@@ -3,7 +3,7 @@
 #   GPU=0 ./h100/run_h100.sh                      # full run: prep build mk_train mk_split mk_paced mk_dyn pt_full pt_graph serve_full serve_mps mps_pair score
 #   PHASES="prep build mk_train mk_split" ./h100/run_h100.sh   # megakernel repro only
 # env: GPU (0) OUT (h100/results/run_<ts>) DATA (~/ofa_data, cached between runs) STEPS (4000) INFER_SMS (21 = FA's 24/148 of 132)
-#      SUDO (sudo) SERVE_RATES ("100 400": open-loop demand in tok/s for mk_paced and mk_dyn)
+#      ALLOW_GPU0 (0: GPU 0 is refused unless 1)  SUDO (sudo) SERVE_RATES ("100 400": open-loop demand in tok/s for mk_paced and mk_dyn)
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd); GPU=${GPU:-0}; STEPS=${STEPS:-4000}; SUDO=${SUDO-sudo}
 OUT=$(realpath -m "${OUT:-$ROOT/h100/results/run_$(date +%Y%m%d_%H%M%S)}"); DATA=$(realpath -m "${DATA:-$HOME/ofa_data}")
@@ -15,6 +15,7 @@ INFER=${INFER_SMS:-21}; TRAIN=$((TOTAL - INFER)); TRAIN_PCT=$(( (100 * TRAIN + T
 PT_IMG=pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel@sha256:3d614dfd422b7e43647491cbf07d6acc516c032fc49c594a94afdebd52552fb9
 VLLM_IMG=vllm/vllm-openai:v0.30.0-x86_64@sha256:5f5e535216848d0c52159c8c13a0af04be5f6fe1a84e79914300610796f76d40
 has() { [[ " $PHASES " == *" $1 "* ]]; }
+[ "$GPU" != 0 ] || [ "${ALLOW_GPU0:-0}" = 1 ] || { echo "refusing GPU 0 without ALLOW_GPU0=1"; exit 4; }
 busy=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader)
 [ -z "$busy" ] || { echo "refusing: GPU $GPU busy (pids $busy)"; exit 3; }
 { nvidia-smi -i "$GPU" --query-gpu=name,driver_version,compute_cap,memory.total --format=csv
