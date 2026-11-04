@@ -1,0 +1,36 @@
+{
+  "id": "ofa-codec-n32-tilecap-bb7fb65143d0",
+  "repo": "nodus-compute/open-flapping-airplanes",
+  "repo_sha": "bb7fb65143d0487959f18a934e47a976ed1282a6",
+  "branch": "devin/1793766400-h100-repro",
+  "gpus": 1,
+  "priority": 77,
+  "cwd": "/home/ubuntu/ofa-bb7fb65143d0",
+  "out": "/home/ubuntu/gpu-queue-runs/ofa-codec-n32-tilecap-bb7fb65143d0",
+  "once": true,
+  "requires_free_gpus": 1,
+  "min_free_mib": 70000,
+  "require_gpu_name": "H100 80GB HBM3",
+  "min_driver_major": 580,
+  "sudo": false,
+  "requires_paths": [
+    "/home/ubuntu/ofa-runs/stage-offline-80782af5e859.ready",
+    "/home/ubuntu/ofa-runs/codec-n32-ts-9873b7990eec.passed"
+  ],
+  "argv": [
+    "bash",
+    "-c",
+    "cd /home/ubuntu/ofa-bb7fb65143d0 && B=\"$(cat /home/ubuntu/ofa-runs/codec-n32-ts-9873b7990eec.passed)\" && python3 h100/codec_verify.py \"$B\" > /dev/null || exit 8; T=$HOME/ofa-runs/codec-n32-tilecap-bb7fb65143d0-$(date -u +%Y%m%dT%H%M%SZ); for A in 4:1 8:1 8:4 8:8; do R=$(echo $A | cut -d: -f1); S=$(echo $A | cut -d: -f2); O=$T-r$R-s$S; (CE_ROWS=$R GNN_KSPLIT=$S GEMM=mma GPU={gpus} ALLOW_GPU0=$(test -n \"{allow_gpu0}\" && echo 1 || echo 0) OFFLINE=1 PY_DEPS=$HOME/ofa_pydeps-tf4.56.2 OUT=$O DATA=$HOME/ofa_data-staged-80782af5e859 TRUNK_CKPT_SUMMARY=$O/trunk_ckpt_summary.json TRAIN_BUBBLE_DATA=$HOME/training-bubble-data PREFLIGHT_DEADLINE_S=60 PREFIX_JOBS=32 TRUNK_CKPT_JOBS=1 TRUNK_CKPT_STEPS=4 CODEC_JOBS=32 CODEC_STEPS=24 CODEC_DEC_TOKENS=2048 CODEC_BATCHES=\"1 8\" CODEC_RESERVE=\"0 64\" CODEC_ATTN_BWD=cuda CODEC_TS=1 PHASES=\"preflight build_trunk trunk_ckpt score_trunk_ckpt codec score_codec\" bash h100/stage_chain.sh --sha bb7fb65143d0487959f18a934e47a976ed1282a6 --jobs 32 --prefix-run PREFIX_RUN_PATH || true); python3 h100/codec_verify.py $O > $O/codec_verify.json || exit 9; python3 h100/f_split.py $O > $O/f_split.json || exit 10; python3 h100/ab_verify.py --common-arms \"$B\" $O > $O/ab_vs_9873b79.json; V=$?; test $S -gt 1 || test $V -eq 0 || exit 11; echo \"$O\" >> $T.bundles; done; printf \"%s\\n\" \"$T\" > /home/ubuntu/ofa-runs/codec-n32-tilecap-bb7fb65143d0.passed.tmp.$$ && mv -f /home/ubuntu/ofa-runs/codec-n32-tilecap-bb7fb65143d0.passed.tmp.$$ /home/ubuntu/ofa-runs/codec-n32-tilecap-bb7fb65143d0.passed"
+  ],
+  "prefix_run_arg": "replace PREFIX_RUN_PATH with the audited wall4x training_prefix N32 seed-413 top-layers-1 run dir (dedicated-0..31)",
+  "purpose": "real-tail tile cap: 9873b79 partial worst tiles were kind 26 T_CE (5690.9 us) and kind 31 T_GNN (5006.8 us, lm_head backward K=VOC). 4 bundles (R=--ce-rows-per-task, S=--gnn-voc-ksplit): r4-s1, r8-s1, r8-s4, r8-s8, each at --dec-reserve 0 and 64 (64 = midpoint of the unmeasured decres sweep 32..128, not a measured best), b in {1,8}",
+  "gates": {
+    "verifier": "per bundle: codec_verify.py exit 0 (per-arm bitwise decode ids and losses vs the same-bundle solo/train-alone/solo16 refs built with the same R,S; TPOT, overlap, one launch, DCGM, 0 errors)",
+    "vs_9873b79": "ab_verify.py --common-arms vs the 9873b79 bundle: must exit 0 (all common dumps byte-equal) for S=1 bundles; recorded report-only for S>1 (split-K changes fp32 summation order)",
+    "f_split": "report-only per arm: f_decode, f_train, U, worst_tile_kind, worst_tile_us, max_tile_us_by_kind",
+    "marker": "atomic, only after all 4 bundles pass",
+    "network": "none (OFFLINE=1)",
+    "gpu": "{gpus}/{allow_gpu0}",
+    "preflight": "60 s, per-GPU-UUID MPS"
+  }
+}
