@@ -5,7 +5,7 @@ Writes nothing. Recomputes from raw artifacts, not from codec_summary.json numbe
   billed:  host wall seconds the GPU was held per arm (<arm>.wall from run_h100.sh dk: start/end/rc); time-slice = union of its 2 processes
   U = (co tokens/billed) / (decode-solo tokens/billed) + (co job-steps/billed) / (train-alone job-steps/billed), per paid GPU-hour;
   2 dedicated GPUs = 1.0 per paid GPU-hour; co_vs_time_slice = U_co / U_ts; best co arm (reserve) per b.
-Real-H100 evidence: preflight.json passed with gpu_name containing H100 80GB HBM3 and the in-container MATMUL_OK; trunk_ckpt_summary
+Real-H100 evidence: preflight.json passed with gpu_name containing --gpu-name (default H100 80GB HBM3; H100 PCIe for the Moeslim class) and the in-container MATMUL_OK; trunk_ckpt_summary
 hf_cut_hidden; every arm rc 0; DCGM/nvidia-smi 100 ms samples covering >= 50% of each gated arm's billed time.
 CODEC_PREFILL=1 bundles (pf solo present): prefill tokens = chunks done x chunk tokens (prefill log lines, all chunks done), pf_out.bf16
 byte-equal to pf solo in every co arm and the time-slice third process, U adds f_prefill, the dedicated baseline is 3 GPUs (1.0 per paid GPU-hour).
@@ -43,6 +43,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("--tpot-ratio", type=float, default=1.10)
+    ap.add_argument("--gpu-name", default="H100 80GB HBM3")
     ap.add_argument("--min-co-vs-time-slice", type=float, default=0.0)
     a = ap.parse_args()
     out, fail = Path(a.out), []
@@ -61,7 +62,7 @@ def main():
     pf, tk, sm = jread("preflight.json"), jread("trunk_ckpt_summary.json"), jread("codec_summary.json")
     ck = (pf or {}).get("checks", {})
     need("preflight_passed", bool(pf and pf.get("passed")))
-    need("real_h100", "H100 80GB HBM3" in ck.get("gpu_name", {}).get("detail", "") and ck.get("gpu_name", {}).get("ok"), ck.get("gpu_name"))
+    need("real_h100", a.gpu_name in ck.get("gpu_name", {}).get("detail", "") and ck.get("gpu_name", {}).get("ok"), ck.get("gpu_name"))
     need("real_cuda_matmul", "MATMUL_OK" in ck.get("container_cuda_matmul_nvcc", {}).get("detail", ""))
     need("hf_cut_hidden", bool(tk and tk.get("gates", {}).get("hf_cut_hidden")))
     need("summary_passed", bool(sm and sm.get("passed")), (sm or {}).get("gates"))
