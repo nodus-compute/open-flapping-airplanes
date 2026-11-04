@@ -39,8 +39,9 @@ constexpr int SMEM = gemm::smem_bytes();
 //           // 64 KB
 static_assert(4 * MAXPOS * 4 <= SMEM, "attention scores fit the GEMM smem");
 
-enum Kind { T_BASEQ, T_BASEV, T_DOWN, T_UPG, T_DB, T_DU, T_DA, T_ADAM, T_LOSS, D_DOWN, D_QKV, D_ATT, D_O, D_HEAD, D_NEXT, T_TUP, T_TDN, T_TCV, T_REMB, T_RRMS, T_RQKN, T_RATT, T_RACT };
-struct Ph { int kind, ntasks, tilesM, reps, layer, f32, koff; gemm::Args ga;
+enum Kind { T_BASEQ, T_BASEV, T_DOWN, T_UPG, T_DB, T_DU, T_DA, T_ADAM, T_LOSS, D_DOWN, D_QKV, D_ATT, D_O, D_HEAD, D_NEXT, T_TUP, T_TDN, T_TCV, T_REMB, T_RRMS, T_RQKN, T_RATT, T_RACT,
+  T_RATTC, T_RQV, T_RCP, T_CE, T_RNB, T_RACTB, T_RADQ, T_RADV, T_GNN };
+struct Ph { int kind, ntasks, tilesM, reps, layer, f32, koff; gemm::Args ga; float *fx, *fx2; const bf16* w2;
 #ifdef MW_GEMM_WG
   const CUtensorMap* tmB; const CUtensorMap* const* tmAx;   // wgmma/TMA backend: B map + one A map per X slot
 #endif
@@ -56,6 +57,7 @@ struct Ctx {
   int jobs, tk, nx; float scale, lr, b1, b2, eps, inv;
   const bf16 *X, *Wq, *Wv, *Tq, *Tv; bf16 *Yq, *Yv;
   const bf16* Remb; const int* rtok; float* rh; bf16 *rqkv, *ratt, *rgu, *ract, *rxn; int rseq; float rms_eps, rtheta;   // --trunk-ckpt real layers
+  const int* rlab; const float *tinv, *lrj; float wd;   // --tail real: shifted labels per slot, 1/n_valid per slot, per-job AdamW lr, weight decay
   int L; const u64* arr; u64 *t0, *tmax; u64 max_ns;   // request decode: L tokens/request, Poisson arrivals (ns after t0); per-kind max train-task ns
   int lt; bf16 *Xt[2], *Ht, *junk;   // frozen shared trunk: lt layers, ping-pong outputs, MLP hidden, per-job-arm scratch
   float *P, *G, *M, *Vm, *U, *dO, *dU, *lpart, *loss; u64* step_done;
@@ -68,6 +70,13 @@ __device__ __forceinline__ u64 gtimer() { u64 t; asm volatile("mov.u64 %0, %glob
 __device__ __forceinline__ int ld_acq(const int* p) { int v; asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v; }
 __device__ __forceinline__ int ld_vol(const int* p) { return *reinterpret_cast<const volatile int*>(p); }
 __device__ __forceinline__ float bf(bf16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ unsigned ld2(const bf16* p) { return *reinterpret_cast<const unsigned*>(p); }
+__device__ __forceinline__ unsigned pk(float lo, float hi) { __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi); return *reinterpret_cast<unsigned*>(&v); }
+__device__ __forceinline__ unsigned pk2(bf16 lo, bf16 hi) { __nv_bfloat162 v; v.x = lo; v.y = hi; return *reinterpret_cast<unsigned*>(&v); }
+__device__ __forceinline__ void mma16816(float* d, const unsigned* a, unsigned b0, unsigned b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
 
 // block-wide sum with a fixed order (thread partials -> smem -> serial sum by thread 0)
 __device__ float block_sum(float v, float* red) {
@@ -128,7 +137,7 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
       break;
     }
     case T_RRMS: {                                             // RMSNorm(h) * w -> bf16 (one warp per token row)
-      const int warp = tid >> 5, lane = tid & 31, t = local * 8 + warp; const float* x = C.rh + (size_t)t * D;
+      const int warp = tid >> 5, lane = tid & 31, t = local * 8 + warp; const float* x = (d.ga.A ? (const float*)d.ga.A : C.rh) + (size_t)t * D;
       const bf16* w = d.ga.B; bf16* o = (bf16*)d.ga.C + (size_t)t * D; float ss = 0.f;
       for (int k = lane; k < D; k += 32) ss = fmaf(x[k], x[k], ss);
       for (int o2 = 16; o2 > 0; o2 >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o2);
@@ -138,7 +147,7 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
     }
     case T_RQKN: {                                             // per-head q/k RMSNorm + rotate-half RoPE in place (warp per (token, head))
       const int warp = tid >> 5, lane = tid & 31, w8 = local * 8 + warp, t = w8 / 40, h = w8 % 40, pos = t % C.rseq;
-      bf16* q = C.rqkv + (size_t)t * NQKV + h * HD; const bf16* nw = d.ga.B + (h < 32 ? 0 : HD);
+      bf16* q = (d.ga.C ? (bf16*)d.ga.C : C.rqkv) + (size_t)t * NQKV + h * HD; const bf16* nw = d.ga.B + (h < 32 ? 0 : HD);
       float x[4], ss = 0.f;
       for (int j = 0; j < 4; j++) { x[j] = bf(q[lane + 32 * j]); ss = fmaf(x[j], x[j], ss); }
       for (int o2 = 16; o2 > 0; o2 >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o2);
@@ -151,25 +160,161 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
     }
     case T_RATT: {                                             // causal GQA attention within each seq segment: warp per (query, head), online softmax, fixed key order
       const int warp = tid >> 5, lane = tid & 31, w8 = local * 8 + warp, t = w8 / 32, h = w8 % 32, g = h / 4, s0 = t - t % C.rseq;
-      const bf16* q = C.rqkv + (size_t)t * NQKV + h * HD; float qv[4], acc[4] = {0.f, 0.f, 0.f, 0.f}, m = -1e30f, l = 0.f;
+      const bf16* QKV = d.ga.A ? d.ga.A : C.rqkv; const bf16* q = QKV + (size_t)t * NQKV + h * HD; float qv[4], acc[4] = {0.f, 0.f, 0.f, 0.f}, m = -1e30f, l = 0.f;
       for (int j = 0; j < 4; j++) qv[j] = bf(q[lane + 32 * j]) * 0.08838834764831845f;
       for (int p = s0; p <= t; p++) {
-        const bf16* k = C.rqkv + (size_t)p * NQKV + NQ + g * HD; float sc = 0.f;
+        const bf16* k = QKV + (size_t)p * NQKV + NQ + g * HD; float sc = 0.f;
         for (int j = 0; j < 4; j++) sc = fmaf(qv[j], bf(k[lane + 32 * j]), sc);
         for (int o2 = 16; o2 > 0; o2 >>= 1) sc += __shfl_xor_sync(0xffffffffu, sc, o2);
         const float mn = fmaxf(m, sc), cr = __expf(m - mn), e = __expf(sc - mn); l = l * cr + e; m = mn;
         const bf16* v = k + NKV;
         for (int j = 0; j < 4; j++) acc[j] = acc[j] * cr + e * bf(v[lane + 32 * j]);
       }
-      bf16* o = C.ratt + (size_t)t * NQ + h * HD;
+      bf16* o = (d.ga.C ? (bf16*)d.ga.C : C.ratt) + (size_t)t * NQ + h * HD;
       for (int j = 0; j < 4; j++) o[lane + 32 * j] = __float2bfloat16(acc[j] / l);
+      if (d.fx && lane == 0) d.fx[(size_t)t * 32 + h] = m + logf(l);   // natural-log LSE of the scaled scores (tail backward)
       break;
     }
     case T_RACT: {                                             // SwiGLU: act = silu(gate) * up from 64-row interleaved gate/up blocks
       const size_t i0 = (size_t)local * THREADS * 8;
       for (int i = 0; i < 8; i++) { const size_t k = i0 + (size_t)i * THREADS + tid, t = k / TI; const int c = (int)(k % TI);
-        const bf16* r = C.rgu + t * 2 * TI + (c / 64) * 128 + c % 64; const float gg = bf(r[0]), uu = bf(r[64]);
-        C.ract[k] = __float2bfloat16(gg / (1.f + __expf(-gg)) * uu); }
+        const bf16* r = (d.ga.A ? d.ga.A : C.rgu) + t * 2 * TI + (c / 64) * 128 + c % 64; const float gg = bf(r[0]), uu = bf(r[64]);
+        (d.ga.C ? (bf16*)d.ga.C : C.ract)[k] = __float2bfloat16(gg / (1.f + __expf(-gg)) * uu); }
+      break;
+    }
+    case T_RATTC: {                                            // tensor-core causal GQA attention: warp = 16 queries x 1 head, mma.sync m16n8k16, online softmax (log2), fixed key-block order
+      const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3, h = local % 32, kvg = h / 4;
+      const int q0 = (local / 32) * 128 + warp * 16, s0 = q0 - q0 % C.rseq;
+      const bf16* QKV = d.ga.A ? d.ga.A : C.rqkv;
+      unsigned qa[8][4];
+      for (int ks = 0; ks < 8; ks++) {
+        const bf16* r0 = QKV + (size_t)(q0 + g) * NQKV + h * HD + ks * 16 + 2 * c; const bf16* r1 = r0 + (size_t)8 * NQKV;
+        qa[ks][0] = ld2(r0); qa[ks][1] = ld2(r1); qa[ks][2] = ld2(r0 + 8); qa[ks][3] = ld2(r1 + 8);
+      }
+      float o[16][4], m[2] = {-1e30f, -1e30f}, l[2] = {0.f, 0.f};
+      for (int n = 0; n < 16; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
+      const float sl2 = 0.08838834764831845f * 1.4426950408889634f;
+      for (int kb = s0; kb <= q0; kb += 16) {
+        float s[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+        for (int nt = 0; nt < 2; nt++) { const bf16* kr = QKV + (size_t)(kb + nt * 8 + g) * NQKV + NQ + kvg * HD + 2 * c;
+          for (int ks = 0; ks < 8; ks++) mma16816(s[nt], qa[ks], ld2(kr + ks * 16), ld2(kr + ks * 16 + 8)); }
+        float cr[2];
+        for (int i = 0; i < 2; i++) {                          // i = 0: row g (regs 0,1); i = 1: row g + 8 (regs 2,3)
+          const int t = q0 + g + 8 * i; float mm = m[i];
+          for (int nt = 0; nt < 2; nt++) for (int e = 0; e < 2; e++) { const int p = kb + nt * 8 + 2 * c + e; float& v = s[nt][2 * i + e]; v = p <= t ? v * sl2 : -1e30f; mm = fmaxf(mm, v); }
+          mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, 1)); mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, 2));
+          cr[i] = exp2f(m[i] - mm); m[i] = mm; l[i] *= cr[i];
+        }
+        float ps[2] = {0.f, 0.f};
+        for (int nt = 0; nt < 2; nt++) for (int e = 0; e < 4; e++) { const float pe = exp2f(s[nt][e] - m[e >> 1]); s[nt][e] = pe; ps[e >> 1] += pe; }
+        for (int i = 0; i < 2; i++) { ps[i] += __shfl_xor_sync(0xffffffffu, ps[i], 1); ps[i] += __shfl_xor_sync(0xffffffffu, ps[i], 2); l[i] += ps[i]; }
+        for (int n = 0; n < 16; n++) { o[n][0] *= cr[0]; o[n][1] *= cr[0]; o[n][2] *= cr[1]; o[n][3] *= cr[1]; }
+        const unsigned pa[4] = {pk(s[0][0], s[0][1]), pk(s[0][2], s[0][3]), pk(s[1][0], s[1][1]), pk(s[1][2], s[1][3])};
+        const bf16* vr = QKV + (size_t)(kb + 2 * c) * NQKV + NQ + NKV + kvg * HD + g;
+        for (int n = 0; n < 16; n++) { const bf16* v0 = vr + n * 8;
+          mma16816(o[n], pa, pk2(v0[0], v0[NQKV]), pk2(v0[(size_t)8 * NQKV], v0[(size_t)9 * NQKV])); }
+      }
+      bf16* out = d.ga.C ? (bf16*)d.ga.C : C.ratt;
+      for (int i = 0; i < 2; i++) { const int t = q0 + g + 8 * i; const float il = 1.f / l[i];
+        for (int n = 0; n < 16; n++) *reinterpret_cast<__nv_bfloat162*>(out + (size_t)t * NQ + h * HD + n * 8 + 2 * c) = __floats2bfloat162_rn(o[n][2 * i] * il, o[n][2 * i + 1] * il);
+        if (d.fx && c == 0) d.fx[(size_t)t * 32 + h] = (m[i] + log2f(l[i])) * 0.6931471805599453f; }
+      break;
+    }
+    case T_RQV: {                                              // real tail, job d.layer: q/k/v = shared base + s*U.B^T on q and v (k = base); pre-norm copy (C) + working copy (aux)
+      const int j = d.layer; const float* Bq = C.P + (size_t)j * PJ + 2 * R * D; const float* Bv = Bq + (size_t)NQ * R;
+      const size_t i0 = (size_t)local * THREADS * 8;
+      for (int i = 0; i < 8; i++) { const size_t k = i0 + (size_t)i * THREADS + tid, t = k / NQKV; const int o = (int)(k % NQKV);
+        float y = bf(d.ga.A[k]);
+        if (o < NQ || o >= NQ + NKV) { const float* u = C.U + ((size_t)j * tk + t) * R2 + (o < NQ ? 0 : R);
+          const float* B = o < NQ ? Bq + (size_t)o * R : Bv + (size_t)(o - NQ - NKV) * R; float s = 0.f;
+          for (int r = 0; r < R; r++) s = fmaf(u[r], B[r], s);
+          y = fmaf(C.scale, s, y); }
+        const bf16 v = __float2bfloat16(y); ((bf16*)d.ga.C)[k] = v; d.ga.aux[k] = v; }
+      break;
+    }
+    case T_RCP: {                                              // fp32 copy (residual stream fork for one job's top layer)
+      const size_t i0 = (size_t)local * THREADS * 8;
+      for (int i = 0; i < 8; i++) { const size_t k = i0 + (size_t)i * THREADS + tid; ((float*)d.ga.C)[k] = d.fx[k]; }
+      break;
+    }
+    case T_CE: {                                               // full-vocab CE per row: lse, loss, dlogits = (softmax - onehot) / n_valid (bf16); 16 rows per task, warp per 2 rows
+      const int warp = tid >> 5, lane = tid & 31; const int* lab = C.rlab + (size_t)(step % C.nx) * tk; const float inv = C.tinv[step % C.nx];
+      __syncthreads();
+      for (int rr = 0; rr < 2; rr++) { const int t = local * 16 + warp * 2 + rr; const float* x = d.fx + (size_t)t * VOC; const int y = lab[t];
+        bf16* gr = (bf16*)d.ga.C + (size_t)t * VOC;
+        if (y < 0) { for (int v = lane; v < VOC; v += 32) gr[v] = __float2bfloat16(0.f); if (lane == 0) red[warp * 2 + rr] = 0.f; continue; }
+        float mm = -1e30f; for (int v = lane; v < VOC; v += 32) mm = fmaxf(mm, x[v]);
+        for (int o2 = 16; o2 > 0; o2 >>= 1) mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, o2));
+        float se = 0.f; for (int v = lane; v < VOC; v += 32) se += __expf(x[v] - mm);
+        for (int o2 = 16; o2 > 0; o2 >>= 1) se += __shfl_xor_sync(0xffffffffu, se, o2);
+        const float lse = mm + logf(se);
+        for (int v = lane; v < VOC; v += 32) gr[v] = __float2bfloat16((__expf(x[v] - lse) - (v == y ? 1.f : 0.f)) * inv);
+        if (lane == 0) red[warp * 2 + rr] = lse - x[y];
+      }
+      __syncthreads();
+      if (tid == 0) { float s = 0.f; for (int i = 0; i < 16; i++) s += red[i]; C.lpart[(size_t)d.layer * rb_per_job + local] = s; }
+      break;
+    }
+    case T_RNB: {                                              // RMSNorm backward (warp per row): dx = inv*w*dy - x*inv^3*sum(w*dy*x)/D (+ residual grad fx2); fp32 (C) + bf16 (aux)
+      const int warp = tid >> 5, lane = tid & 31, t = local * 8 + warp; const float* x = (const float*)d.ga.A + (size_t)t * D; const float* dy = d.fx + (size_t)t * D;
+      float ss = 0.f, sg = 0.f;
+      for (int k = lane; k < D; k += 32) { ss = fmaf(x[k], x[k], ss); sg = fmaf(bf(d.ga.B[k]) * dy[k], x[k], sg); }
+      for (int o2 = 16; o2 > 0; o2 >>= 1) { ss += __shfl_xor_sync(0xffffffffu, ss, o2); sg += __shfl_xor_sync(0xffffffffu, sg, o2); }
+      const float inv = rsqrtf(ss / D + C.rms_eps), c3 = inv * inv * inv * sg / D;
+      float* o = (float*)d.ga.C + (size_t)t * D; bf16* ob = d.ga.aux + (size_t)t * D;
+      for (int k = lane; k < D; k += 32) { float v = inv * bf(d.ga.B[k]) * dy[k] - x[k] * c3; if (d.fx2) v += d.fx2[(size_t)t * D + k]; o[k] = v; ob[k] = __float2bfloat16(v); }
+      break;
+    }
+    case T_RACTB: {                                            // SwiGLU backward into the 64-row interleaved gate/up layout
+      const size_t i0 = (size_t)local * THREADS * 8;
+      for (int i = 0; i < 8; i++) { const size_t k = i0 + (size_t)i * THREADS + tid, t = k / TI; const int c = (int)(k % TI);
+        const size_t r = t * 2 * TI + (c / 64) * 128 + c % 64; const float gg = bf(d.ga.A[r]), uu = bf(d.ga.A[r + 64]), da = bf(d.ga.B[k]);
+        const float sg = 1.f / (1.f + __expf(-gg));
+        ((bf16*)d.ga.C)[r] = __float2bfloat16(da * uu * sg * (1.f + gg * (1.f - sg))); ((bf16*)d.ga.C)[r + 64] = __float2bfloat16(da * gg * sg); }
+      break;
+    }
+    case T_RADQ: {                                             // attention backward for dq (warp per (query, head)), then RoPE^T and q-norm backward -> dO[j][t][q cols]
+      const int warp = tid >> 5, lane = tid & 31, w8 = local * 8 + warp, t = w8 / 32, h = w8 % 32, g = h / 4, s0 = t - t % C.rseq, pos = t % C.rseq;
+      const bf16* QKV = d.ga.A; const bf16* q = QKV + (size_t)t * NQKV + h * HD; const bf16* oo = d.ga.B + (size_t)t * NQ + h * HD; const bf16* go = d.ga.aux + (size_t)t * NQ + h * HD;
+      const float sc = 0.08838834764831845f, lse = d.fx[(size_t)t * 32 + h];
+      float qv[4], gv[4], dq[4] = {0.f, 0.f, 0.f, 0.f}, Dt = 0.f;
+      for (int i = 0; i < 4; i++) { qv[i] = bf(q[lane + 32 * i]) * sc; gv[i] = bf(go[lane + 32 * i]); Dt = fmaf(gv[i], bf(oo[lane + 32 * i]), Dt); }
+      for (int o2 = 16; o2 > 0; o2 >>= 1) Dt += __shfl_xor_sync(0xffffffffu, Dt, o2);
+      for (int p = s0; p <= t; p++) {
+        const bf16* k = QKV + (size_t)p * NQKV + NQ + g * HD; const bf16* v = k + NKV; float s = 0.f, dp = 0.f;
+        for (int i = 0; i < 4; i++) { s = fmaf(qv[i], bf(k[lane + 32 * i]), s); dp = fmaf(gv[i], bf(v[lane + 32 * i]), dp); }
+        for (int o2 = 16; o2 > 0; o2 >>= 1) { s += __shfl_xor_sync(0xffffffffu, s, o2); dp += __shfl_xor_sync(0xffffffffu, dp, o2); }
+        const float ds = __expf(s - lse) * (dp - Dt);
+        for (int i = 0; i < 4; i++) dq[i] = fmaf(ds, bf(k[lane + 32 * i]), dq[i]);
+      }
+      for (int i = 0; i < 4; i++) dq[i] *= sc;
+      for (int i = 0; i < 2; i++) { const int dd = lane + 32 * i; const float ang = (float)pos * powf(C.rtheta, -(float)(2 * dd) / (float)HD);
+        const float cs = cosf(ang), sn = sinf(ang), a0 = dq[i], a1 = dq[i + 2]; dq[i] = a0 * cs + a1 * sn; dq[i + 2] = a1 * cs - a0 * sn; }
+      const bf16* xp = (const bf16*)d.ga.C + (size_t)t * NQKV + h * HD; float x[4], ss = 0.f, sg = 0.f;
+      for (int i = 0; i < 4; i++) { x[i] = bf(xp[lane + 32 * i]); ss = fmaf(x[i], x[i], ss); sg = fmaf(dq[i] * bf(d.w2[lane + 32 * i]), x[i], sg); }
+      for (int o2 = 16; o2 > 0; o2 >>= 1) { ss += __shfl_xor_sync(0xffffffffu, ss, o2); sg += __shfl_xor_sync(0xffffffffu, sg, o2); }
+      const float inv = rsqrtf(ss / HD + C.rms_eps), c3 = inv * inv * inv * sg / HD;
+      float* out = C.dO + ((size_t)d.layer * tk + t) * NQV + h * HD;
+      for (int i = 0; i < 4; i++) out[lane + 32 * i] = inv * bf(d.w2[lane + 32 * i]) * dq[i] - x[i] * c3;
+      break;
+    }
+    case T_RADV: {                                             // attention backward for dv (warp per (key, kv head)): later queries of the group's 4 heads -> dO[j][p][v cols]
+      const int warp = tid >> 5, lane = tid & 31, w8 = local * 8 + warp, p = w8 / NKVH, g = w8 % NKVH, s1 = p - p % C.rseq + C.rseq;
+      const bf16* QKV = d.ga.A; const bf16* k = QKV + (size_t)p * NQKV + NQ + g * HD; float kv[4], acc[4] = {0.f, 0.f, 0.f, 0.f};
+      for (int i = 0; i < 4; i++) kv[i] = bf(k[lane + 32 * i]);
+      for (int t = p; t < s1; t++) for (int hh = 0; hh < 4; hh++) { const int h = g * 4 + hh; const bf16* q = QKV + (size_t)t * NQKV + h * HD; float s = 0.f;
+        for (int i = 0; i < 4; i++) s = fmaf(bf(q[lane + 32 * i]) * 0.08838834764831845f, kv[i], s);
+        for (int o2 = 16; o2 > 0; o2 >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o2);
+        const float pe = __expf(s - d.fx[(size_t)t * 32 + h]); const bf16* go = d.ga.aux + (size_t)t * NQ + h * HD;
+        for (int i = 0; i < 4; i++) acc[i] = fmaf(pe, bf(go[lane + 32 * i]), acc[i]); }
+      float* out = C.dO + ((size_t)d.layer * tk + p) * NQV + NQ + g * HD;
+      for (int i = 0; i < 4; i++) out[lane + 32 * i] = acc[i];
+      break;
+    }
+    case T_GNN: {                                              // real-tail backward GEMM C = A.B with B stored [K][N] (mma.sync tile)
+      gemm::Args a = d.ga;
+      if (d.f32) gemm::gemm_tile<gemm::NN, gemm::EPI_F32>(a, local % d.tilesM, local / d.tilesM, smem);
+      else gemm::gemm_tile<gemm::NN, gemm::EPI_BF16>(a, local % d.tilesM, local / d.tilesM, smem);
       break;
     }
     case T_TUP: case T_TDN: {                                  // frozen trunk GEMM (K chunk d.koff if split); reps > 1 = per-job arm (rep > 0 writes scratch)
@@ -253,12 +398,13 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
       for (int e = 0; e < 4; e++) {
         const size_t i = base + (size_t)e * THREADS + tid; const float g = C.G[i];
         const float m = C.M[i] = C.b1 * C.M[i] + (1.f - C.b1) * g, v = C.Vm[i] = C.b2 * C.Vm[i] + (1.f - C.b2) * g * g;
-        C.P[i] -= C.lr * (m / bc1) / (sqrtf(v / bc2) + C.eps);
+        const float lr = C.lrj ? C.lrj[j] : C.lr; if (C.wd != 0.f) C.P[i] *= 1.f - lr * C.wd;   // torch AdamW: decoupled decay first
+        C.P[i] -= lr * (m / bc1) / (sqrtf(v / bc2) + C.eps);
       }
       break;
     }
     case T_LOSS: {
-      if (tid < C.jobs) { float s = 0.f; for (int i = 0; i < rb_per_job; i++) s += C.lpart[(size_t)tid * rb_per_job + i]; C.loss[(size_t)step * C.jobs + tid] = s * C.inv; }
+      if (tid < C.jobs) { float s = 0.f; for (int i = 0; i < rb_per_job; i++) s += C.lpart[(size_t)tid * rb_per_job + i]; C.loss[(size_t)step * C.jobs + tid] = s * (C.tinv ? C.tinv[step % C.nx] : C.inv); }
       break;
     }
     default: break;
@@ -510,7 +656,7 @@ static void pct(std::vector<double> v, double& p50, double& p99) { if (v.empty()
 int main(int argc, char** argv) {
   std::string mode_s = "co", dir; int jobs = 16, tk = 512, steps = 16, b = 1, ctx0 = 1024, dtok = 2048, infer_sms = 33, nx = 4, lend = 0; u64 seed = 1234;
   int lt = 0, jb = 0; std::string trunk_s = "shared";
-  int nreq = 64, Lr = 64, kc = 0, rseq = 512; std::string ckpt; double rate = 0, max_s = 0; std::string split_s = "static";
+  int nreq = 64, Lr = 64, kc = 0, rseq = 512; std::string ckpt, attn_s = "cuda", tail_s = "mse", tdata; double rate = 0, max_s = 0; std::string split_s = "static";
   for (int i = 1; i < argc; i++) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s) && i + 1 < argc; };
     if (is("--mode")) mode_s = argv[++i]; else if (is("--jobs")) jobs = atoi(argv[++i]); else if (is("--tokens")) tk = atoi(argv[++i]);
@@ -519,10 +665,15 @@ int main(int argc, char** argv) {
     else if (is("--sm-split")) split_s = argv[++i]; else if (is("--rate")) rate = atof(argv[++i]); else if (is("--nreq")) nreq = atoi(argv[++i]);
     else if (is("--req-tokens")) Lr = atoi(argv[++i]); else if (is("--trunk-kchunk")) kc = atoi(argv[++i]); else if (is("--trunk-ckpt")) ckpt = argv[++i]; else if (is("--seq")) rseq = atoi(argv[++i]); else if (is("--max-seconds")) max_s = atof(argv[++i]);
     else if (is("--trunk-layers")) lt = atoi(argv[++i]); else if (is("--trunk")) trunk_s = argv[++i]; else if (is("--job-base")) jb = atoi(argv[++i]);
+    else if (is("--attn")) attn_s = argv[++i]; else if (is("--tail")) tail_s = argv[++i]; else if (is("--tail-data")) tdata = argv[++i];
     else if (!strcmp(argv[i], "--lend")) lend = 1; else if (is("--seed")) seed = atoll(argv[++i]); else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
   }
   if (rate > 0) dtok = nreq * Lr;
   const int mode = mode_s == "train" ? 0 : mode_s == "dec" ? 1 : mode_s == "co" ? 2 : -1;
+  const bool treal = tail_s == "real", atc = attn_s == "tc";
+  if ((attn_s != "cuda" && !atc) || (tail_s != "mse" && !treal) || (atc && ckpt.empty()) || (treal && (ckpt.empty() || tdata.empty() || mode != 0 || rseq % 128))) {
+    fprintf(stderr, "bad --attn/--tail: tc attention and the real tail need --trunk-ckpt; --tail real needs --tail-data and --mode train\n"); return 2; }
+  if (treal) nx = steps;   // one real microbatch per step (training_prefix row order)
   if (lt < 0 || lt > 64 || jb < 0 || (trunk_s != "shared" && trunk_s != "perjob") || (split_s != "static" && split_s != "dynamic") || (rate > 0 && (nreq < 1 || Lr < 2)) || kc < 0 || (!ckpt.empty() && (lt < 1 || rseq < 1 || tk % rseq))) { fprintf(stderr, "bad --trunk-layers (0..64) / --trunk shared|perjob / --job-base\n"); return 2; }
   if (mode < 0 || jobs < 1 || jobs > THREADS || tk % 128 || b < 1 || b > MAXB || ctx0 < 1 || steps < 1 || (mode != 0 && ctx0 + (rate > 0 ? Lr : dtok) > MAXPOS)) {
     fprintf(stderr, "bad args: --mode train|dec|co, --tokens multiple of 128, 1<=b<=8, ctx+dec-tokens<=%d\n", MAXPOS); return 2; }
@@ -572,7 +723,7 @@ int main(int argc, char** argv) {
     while (off < total) { const size_t n = std::min(buf.size(), total - off); if (fread(buf.data(), 2, n, wf) != n) { fprintf(stderr, "short weights file\n"); return 2; }
       CK(cudaMemcpy(w + off, buf.data(), n * 2, cudaMemcpyHostToDevice)); off += n; }
     fclose(wf);
-    std::vector<int> tok((size_t)nx * tk); FILE* tf = fopen((ckpt + "/train_tokens.i32").c_str(), "rb");
+    std::vector<int> tok((size_t)nx * tk); FILE* tf = fopen((treal ? tdata + "/tail_tokens.i32" : ckpt + "/train_tokens.i32").c_str(), "rb");
     if (!tf || fread(tok.data(), 4, tok.size(), tf) != tok.size()) { fprintf(stderr, "cannot read %zu tokens from %s/train_tokens.i32\n", tok.size(), ckpt.c_str()); return 2; }
     fclose(tf); for (int t : tok) if (t < 0 || t >= V) { fprintf(stderr, "token id out of range\n"); return 2; }
     int* dt = dalloc<int>(tok.size()); CK(cudaMemcpy(dt, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice));
@@ -589,6 +740,31 @@ int main(int argc, char** argv) {
   float* Cf = lt && kc ? dalloc<float>((size_t)tk * TI) : nullptr;
   C.P = dalloc<float>((size_t)jobs * PJ);
   for (int j = 0; j < jobs; j++) fill_f32<<<256, 256>>>(C.P + (size_t)j * PJ, 2 * R * D, seed * 977 + jb + j, 1.7320508f / sqrtf((float)D));   // A random, B zero (LoRA init)
+  // --tail real: training_prefix tail inputs from h100/tail_prep.py (tokens, shifted labels, LoRA A init, per-job lr); one scratch set, jobs serialized
+  C.rlab = nullptr; C.tinv = nullptr; C.lrj = nullptr; C.wd = 0.f;
+  bf16 *Yb = nullptr, *Qpre = nullptr, *Qn = nullptr, *Tatt = nullptr, *Txn = nullptr, *Tgu = nullptr, *Tact = nullptr, *Thf = nullptr, *TdL = nullptr;
+  bf16 *Tdh3b = nullptr, *Tdact = nullptr, *Tdgu = nullptr, *Tdh2b = nullptr, *Tdatt = nullptr;
+  float *Tlse = nullptr, *Th2 = nullptr, *Th3 = nullptr, *TL = nullptr, *Tdhf = nullptr, *Tdh3 = nullptr, *Tdxn = nullptr, *Tdh2 = nullptr;
+  if (treal) {
+    auto rd = [&](const char* name, void* dst, size_t bytes, size_t skip) { FILE* f = fopen((tdata + "/" + name).c_str(), "rb");
+      if (!f || fseek(f, (long)skip, SEEK_SET) || fread(dst, 1, bytes, f) != bytes) { fprintf(stderr, "cannot read %zu bytes at %zu from %s/%s\n", bytes, skip, tdata.c_str(), name); exit(2); }
+      fclose(f); };
+    std::vector<float> a0((size_t)jobs * 2 * R * D), lr(jobs); std::vector<int> lab((size_t)nx * tk);
+    rd("tail_A.f32", a0.data(), a0.size() * 4, (size_t)jb * 2 * R * D * 4); rd("tail_lr.f32", lr.data(), lr.size() * 4, (size_t)jb * 4); rd("tail_labels.i32", lab.data(), lab.size() * 4, 0);
+    for (int j = 0; j < jobs; j++) CK(cudaMemcpy(C.P + (size_t)j * PJ, a0.data() + (size_t)j * 2 * R * D, (size_t)2 * R * D * 4, cudaMemcpyHostToDevice));
+    std::vector<float> tinv(nx);
+    for (int x = 0; x < nx; x++) { int nv = 0; for (int t = 0; t < tk; t++) { const int y = lab[(size_t)x * tk + t]; if (y >= VOC) { fprintf(stderr, "label out of range\n"); return 2; } nv += y >= 0; }
+      if (!nv) { fprintf(stderr, "microbatch %d has no labels\n", x); return 2; } tinv[x] = 1.f / nv; }
+    int* dl = dalloc<int>(lab.size()); CK(cudaMemcpy(dl, lab.data(), lab.size() * 4, cudaMemcpyHostToDevice)); C.rlab = dl;
+    float* dti = dalloc<float>(nx); CK(cudaMemcpy(dti, tinv.data(), nx * 4, cudaMemcpyHostToDevice)); C.tinv = dti;
+    float* dlr = dalloc<float>(jobs); CK(cudaMemcpy(dlr, lr.data(), jobs * 4, cudaMemcpyHostToDevice)); C.lrj = dlr; C.wd = 0.01f;
+    const size_t T = tk;
+    Yb = dalloc<bf16>(T * NQKV); Qpre = dalloc<bf16>(T * NQKV); Qn = dalloc<bf16>(T * NQKV); Tatt = dalloc<bf16>(T * NQ); Tlse = dalloc<float>(T * 32);
+    Th2 = dalloc<float>(T * D); Th3 = dalloc<float>(T * D); Txn = dalloc<bf16>(T * D); Thf = dalloc<bf16>(T * D); Tgu = dalloc<bf16>(T * 2 * TI); Tact = dalloc<bf16>(T * TI);
+    TL = dalloc<float>(T * VOC); TdL = dalloc<bf16>(T * VOC); Tdhf = dalloc<float>(T * D); Tdh3 = dalloc<float>(T * D); Tdh3b = dalloc<bf16>(T * D);
+    Tdact = dalloc<bf16>(T * TI); Tdgu = dalloc<bf16>(T * 2 * TI); Tdxn = dalloc<float>(T * D); Tdh2 = dalloc<float>(T * D); Tdh2b = dalloc<bf16>(T * D); Tdatt = dalloc<bf16>(T * NQ);
+    printf("tail real: %s, %d microbatches, jobs %d..%d, lr %g..%g, AdamW wd 0.01, CE over %d vocab\n", tdata.c_str(), nx, jb, jb + jobs - 1, lr[0], lr[jobs - 1], VOC);
+  }
   C.G = dalloc<float>((size_t)jobs * PJ); C.M = dalloc<float>((size_t)jobs * PJ); C.Vm = dalloc<float>((size_t)jobs * PJ);
   C.U = dalloc<float>((size_t)jobs * tk * R2); C.dU = dalloc<float>((size_t)jobs * tk * R2); C.dO = dalloc<float>((size_t)jobs * tk * NQV);
   C.lpart = dalloc<float>((size_t)jobs * (tk / ROWS)); C.loss = dalloc<float>((size_t)steps * jobs); C.step_done = dalloc<u64>(steps);
@@ -603,7 +779,7 @@ int main(int argc, char** argv) {
   CK(cudaDeviceSynchronize());
   { std::vector<bf16> e((size_t)MAXB * D); CK(cudaMemcpy(e.data(), C.E + D, e.size() * 2, cudaMemcpyDeviceToHost));
     std::vector<float> h(e.size()); for (size_t i = 0; i < e.size(); i++) h[i] = __bfloat162float(e[i]); CK(cudaMemcpy(C.h, h.data(), h.size() * 4, cudaMemcpyHostToDevice)); }
-  if (!dir.empty() && mode != 1) { dump(dir, "init_P.f32", C.P, (size_t)jobs * PJ); dump(dir, "X.bf16", C.X, (size_t)nx * tk * D); dump(dir, "Wq.bf16", C.Wq, (size_t)NQ * D);
+  if (!dir.empty() && mode != 1 && !treal) { dump(dir, "init_P.f32", C.P, (size_t)jobs * PJ); dump(dir, "X.bf16", C.X, (size_t)nx * tk * D); dump(dir, "Wq.bf16", C.Wq, (size_t)NQ * D);
     dump(dir, "Wv.bf16", C.Wv, (size_t)NKV * D); dump(dir, "Tq.bf16", C.Tq, (size_t)tk * NQ); dump(dir, "Tv.bf16", C.Tv, (size_t)tk * NKV); }
 
   // train graph (per step); (phase, -1) = previous step
@@ -612,6 +788,7 @@ int main(int argc, char** argv) {
   for (Ph* p : {&q, &v}) { const int n = p == &q ? NQ : NKV; p->ga.A = C.X; p->ga.B = p == &q ? C.Wq : C.Wv; p->ga.C = p == &q ? (void*)C.Yq : (void*)C.Yv;
     p->ga.lda = D; p->ga.ldb = D; p->ga.ldc = n; p->ga.ldaux = 8; p->ga.M = tk; p->ga.N = n; p->ga.K = D; p->tilesM = tk / 128; p->ntasks = (tk / 128) * (n / 128);
     if (!gemm::args_ok(p->ga)) { fprintf(stderr, "bad GEMM args\n"); return 2; } }
+  if (treal) { q.ga.N = NQKV; q.ga.ldc = NQKV; q.ga.C = Yb; q.ntasks = (tk / 128) * (NQKV / 128); }   // real tail: shared base q/k/v of layer lt
 #ifdef MW_GEMM_WG
   for (Ph* p : {&q, &v}) { std::vector<const CUtensorMap*> maps(nx);
     for (int x = 0; x < nx; x++) maps[x] = gemm::sm90::make_map(lt ? C.Xt[lt % 2] : C.X + (size_t)x * tk * D, D, tk, D, 64, 128);
@@ -622,7 +799,8 @@ int main(int argc, char** argv) {
   printf("gemm_backend mma_sync\n");
 #endif
   const int KS1 = kc && D > kc ? D / kc : 1, KS2 = kc && TI > kc ? TI / kc : 1;   // split-K chunks (up K=D, down K=TI): bounds trunk tile time
-  const int T0 = !ckpt.empty() ? (trunk_s == "perjob" ? jobs : 1) * (2 + 9 * lt) : lt * ((KS1 > 1 ? KS1 + 1 : 1) + (KS2 > 1 ? KS2 + 1 : 1)), ADAM = T0 + 7, LOSS = T0 + 8, reps = trunk_s == "perjob" ? jobs : 1;
+  const int XT = treal ? jobs * 22 - 1 : 0;   // real tail: 22 per-job phases replace T_UPG
+  const int T0 = !ckpt.empty() ? (trunk_s == "perjob" ? jobs : 1) * (2 + 9 * lt) : lt * ((KS1 > 1 ? KS1 + 1 : 1) + (KS2 > 1 ? KS2 + 1 : 1)), ADAM = T0 + 7 + XT, LOSS = T0 + 8 + XT, reps = trunk_s == "perjob" ? jobs : 1;
   int prev = -1;
   auto dep_prev = [&](const Ph& t) { prev = prev < 0 ? Bt.add(t, {make_int2(ADAM, -1)}) : Bt.add(t, {make_int2(prev, 0)}); };
   if (ckpt.empty()) for (int l = 0; l < lt; l++) for (int k = 0; k < 2; k++) {   // trunk phases first: tickets are claimed in phase order
@@ -660,7 +838,7 @@ int main(int argc, char** argv) {
     for (int l = 0; l < lt; l++) {
       const bf16* W = RW + (size_t)l * lst; const bf16* Wn = W + D + (size_t)NQKV * D; const bf16* Wo = Wn + 2 * HD; const bf16* Wp = Wo + (size_t)D * NQ;
       const bf16* Wgu = Wp + D; const bf16* Wd = Wgu + (size_t)2 * TI * D;
-      ew(T_RRMS, tk / 8, W, C.rxn); gm(C.rxn, W + D, C.rqkv, NQKV, D, 0); ew(T_RQKN, tk * 40 / 8, Wn, nullptr); ew(T_RATT, tk * 32 / 8, nullptr, nullptr);
+      ew(T_RRMS, tk / 8, W, C.rxn); gm(C.rxn, W + D, C.rqkv, NQKV, D, 0); ew(T_RQKN, tk * 40 / 8, Wn, nullptr); if (atc) ew(T_RATTC, tk / 4, nullptr, nullptr); else ew(T_RATT, tk * 32 / 8, nullptr, nullptr);
       gm(C.ratt, Wo, C.rh, D, NQ, 1); ew(T_RRMS, tk / 8, Wp, C.rxn); gm(C.rxn, Wgu, C.rgu, 2 * TI, D, 0);
       ew(T_RACT, tk * TI / (THREADS * 8), nullptr, nullptr); gm(C.ract, Wd, C.rh, D, TI, 1);
     }
@@ -670,12 +848,56 @@ int main(int argc, char** argv) {
   if (lt) { Bt.add(q, {make_int2(LOSS, -1), make_int2(T0 - 1, 0)}); Bt.add(v, {make_int2(LOSS, -1), make_int2(T0 - 1, 0)});
     Bt.add(mk(T_DOWN, rbt), {make_int2(ADAM, -1), make_int2(T0 - 1, 0)}); }
   else { Bt.add(q, {make_int2(LOSS, -1)}); Bt.add(v, {make_int2(LOSS, -1)}); Bt.add(mk(T_DOWN, rbt), {make_int2(ADAM, -1)}); }
-  Bt.add(mk(T_UPG, rbt), {make_int2(T0 + 0, 0), make_int2(T0 + 1, 0), make_int2(T0 + 2, 0)});
-  Bt.add(mk(T_DB, jobs * (NQV / THREADS)), {make_int2(T0 + 3, 0)});
-  Bt.add(mk(T_DU, rbt), {make_int2(T0 + 3, 0)});
-  Bt.add(mk(T_DA, jobs * (D / THREADS)), {make_int2(T0 + 5, 0)});
-  Bt.add(mk(T_ADAM, jobs * (PJ / (THREADS * 4))), {make_int2(T0 + 4, 0), make_int2(T0 + 6, 0)});
-  Bt.add(mk(T_LOSS, 1), {make_int2(T0 + 3, 0)});
+  if (!treal) Bt.add(mk(T_UPG, rbt), {make_int2(T0 + 0, 0), make_int2(T0 + 1, 0), make_int2(T0 + 2, 0)});
+  else {   // real top layer per job (training_prefix tail): forward, lm_head + CE, backward to dq/dv -> dO; jobs chained in order over one scratch set
+    const bf16* W = RW + (size_t)lt * lst; const bf16* Wn = W + D + (size_t)NQKV * D; const bf16* Wo = Wn + 2 * HD; const bf16* Wp = Wo + (size_t)D * NQ;
+    const bf16* Wgu = Wp + D; const bf16* Wd = Wgu + (size_t)2 * TI * D; const bf16* Wf = C.Remb + (size_t)VOC * D;
+    int cprev = -1, jj = 0;
+    auto chn = [&](Ph t) { t.layer = jj; cprev = cprev < 0 ? Bt.add(t, {make_int2(T0 + 0, 0), make_int2(T0 + 1, 0), make_int2(T0 + 2, 0)}) : Bt.add(t, {make_int2(cprev, 0)}); };
+    auto ewj = [&](int kind, int nt, const bf16* A, const bf16* Bp, void* Cp, bf16* aux, float* fx, float* fx2, const bf16* w2) {
+      Ph t = mk(kind, nt); t.ga.A = A; t.ga.B = Bp; t.ga.C = Cp; t.ga.aux = aux; t.fx = fx; t.fx2 = fx2; t.w2 = w2; chn(t); };
+    auto gmj = [&](int kind, const bf16* A, const bf16* Bp, void* Cp, int n, int k, int f32, int acc) {   // T_TDN: C (+)= A.B^T (B [N][K]); T_GNN: C = A.B (B [K][N])
+      Ph t = mk(kind, (tk / 128) * (n / 128)); t.reps = 1; t.f32 = f32; t.tilesM = tk / 128;
+      t.ga.A = A; t.ga.B = Bp; t.ga.C = Cp; t.ga.accumulate = acc; t.ga.lda = k; t.ga.ldb = kind == T_GNN ? n : k; t.ga.ldc = n; t.ga.ldaux = 8; t.ga.M = tk; t.ga.N = n; t.ga.K = k;
+      if (!gemm::args_ok(t.ga)) { fprintf(stderr, "bad real-tail GEMM args\n"); exit(2); }
+#ifdef MW_GEMM_WG
+      if (kind == T_TDN) { const CUtensorMap* m0 = gemm::sm90::make_map(A, k, tk, k, 64, 128); const CUtensorMap** dm; CK(cudaMalloc(&dm, sizeof(void*)));
+        CK(cudaMemcpy(dm, &m0, sizeof(void*), cudaMemcpyHostToDevice)); t.tmAx = dm; t.tmB = gemm::sm90::make_map(Bp, k, n, k, 64, 128); }
+#endif
+      chn(t); };
+    const int E8 = (int)((size_t)tk * D / (THREADS * 8)), EI = (int)((size_t)tk * TI / (THREADS * 8));
+    for (jj = 0; jj < jobs; jj++) {
+      ewj(T_RQV, (int)((size_t)tk * NQKV / (THREADS * 8)), Yb, nullptr, Qpre, Qn, nullptr, nullptr, nullptr);
+      ewj(T_RQKN, tk * 40 / 8, nullptr, Wn, Qn, nullptr, nullptr, nullptr, nullptr);
+      ewj(atc ? T_RATTC : T_RATT, atc ? tk / 4 : tk * 32 / 8, Qn, nullptr, Tatt, nullptr, Tlse, nullptr, nullptr);
+      ewj(T_RCP, E8, nullptr, nullptr, Th2, nullptr, C.rh, nullptr, nullptr);
+      gmj(T_TDN, Tatt, Wo, Th2, D, NQ, 1, 1);
+      ewj(T_RRMS, tk / 8, reinterpret_cast<const bf16*>(Th2), Wp, Txn, nullptr, nullptr, nullptr, nullptr);
+      gmj(T_TDN, Txn, Wgu, Tgu, 2 * TI, D, 0, 0);
+      ewj(T_RACT, EI, Tgu, nullptr, Tact, nullptr, nullptr, nullptr, nullptr);
+      ewj(T_RCP, E8, nullptr, nullptr, Th3, nullptr, Th2, nullptr, nullptr);
+      gmj(T_TDN, Tact, Wd, Th3, D, TI, 1, 1);
+      ewj(T_RRMS, tk / 8, reinterpret_cast<const bf16*>(Th3), Wf, Thf, nullptr, nullptr, nullptr, nullptr);
+      gmj(T_TDN, Thf, C.Remb, TL, VOC, D, 1, 0);                                  // logits (fp32, one job at a time)
+      ewj(T_CE, tk / 16, nullptr, nullptr, TdL, nullptr, TL, nullptr, nullptr);
+      gmj(T_GNN, TdL, C.Remb, Tdhf, D, VOC, 1, 0);                                // dhidden = dlogits . E (lm_head frozen: no weight grad)
+      ewj(T_RNB, tk / 8, reinterpret_cast<const bf16*>(Th3), Wf, Tdh3, Tdh3b, Tdhf, nullptr, nullptr);
+      gmj(T_GNN, Tdh3b, Wd, Tdact, TI, D, 0, 0);
+      ewj(T_RACTB, EI, Tgu, Tdact, Tdgu, nullptr, nullptr, nullptr, nullptr);
+      gmj(T_GNN, Tdgu, Wgu, Tdxn, D, 2 * TI, 1, 0);
+      ewj(T_RNB, tk / 8, reinterpret_cast<const bf16*>(Th2), Wp, Tdh2, Tdh2b, Tdxn, Tdh3, nullptr);
+      gmj(T_GNN, Tdh2b, Wo, Tdatt, NQ, D, 0, 0);
+      ewj(T_RADQ, tk * 32 / 8, Qn, Tatt, Qpre, Tdatt, Tlse, nullptr, Wn);
+      ewj(T_RADV, tk * NKVH / 8, Qn, nullptr, nullptr, Tdatt, Tlse, nullptr, nullptr);
+    }
+  }
+  Bt.add(mk(T_DB, jobs * (NQV / THREADS)), {make_int2(T0 + 3 + XT, 0)});
+  Bt.add(mk(T_DU, rbt), {make_int2(T0 + 3 + XT, 0)});
+  Bt.add(mk(T_DA, jobs * (D / THREADS)), {make_int2(T0 + 5 + XT, 0)});
+  Bt.add(mk(T_ADAM, jobs * (PJ / (THREADS * 4))), {make_int2(T0 + 4 + XT, 0), make_int2(T0 + 6 + XT, 0)});
+  Bt.add(mk(T_LOSS, 1), {make_int2(T0 + 3 + XT, 0)});
+  if ((int)Bt.ph.size() != LOSS + 1) { fprintf(stderr, "tail phase count mismatch\n"); return 2; }
+  printf("tail %s, attn %s\n", tail_s.c_str(), attn_s.c_str());
   printf("trunk: %d frozen layers (%s, k-chunk %d), job-base %d, sm-split %s, kernel launches 1 for %d steps\n", lt, trunk_s.c_str(), kc, jb, split_s.c_str(), steps);
   upload(Bt, mode == 1 ? 0 : steps, ADAM, C.tr);
   // decode graph (per token)

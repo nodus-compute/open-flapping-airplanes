@@ -281,7 +281,7 @@ has score_dyn && python3 "$ROOT/h100/dyn_score.py" "$OUT"
 TCK=/root/data/mm/qwen3_4b; TCL=${TRUNK_CKPT_LAYERS:-35}; TCT=${TRUNK_CKPT_TOKENS:-2048}; TCN=${TRUNK_CKPT_JOBS:-8 16 32}; TCS=${TRUNK_CKPT_STEPS:-50}
 if has trunk_ckpt; then
   dk $PT_IMG tck_prep.log -v "$HFC":/root/.cache/huggingface -e HF_TOKEN -- "$MM_PIP && python h100/mm_prep.py --repo Qwen/Qwen3-4B --revision $MM_REV1 --out $TCK && python h100/trunk_prep.py --repo Qwen/Qwen3-4B --revision $MM_REV1 --model-dir $TCK --tokens $((4 * TCT))"
-  TCA="--trunk-ckpt $TCK --trunk-layers $TCL --tokens $TCT --seq 512"
+  TCA="--trunk-ckpt $TCK --trunk-layers $TCL --tokens $TCT --seq 512 --attn ${TRUNK_ATTN:-cuda}"
   tcd() { mkdir -p "$OUT/tck/$1"; local n=$1; shift; dk $PT_IMG tck_$n.log "$@"; }
   tcd ref1 -- "timeout -k 10 900 $TR --mode train --jobs 1 $TCA --steps 1 --dump /out/tck/ref1"
   dk $PT_IMG tck_hf.log -v "$HFC":/root/.cache/huggingface -e HF_TOKEN -- "$MM_PIP && python h100/trunk_ckpt_ref.py --out /out/tck/ref1 --model-dir $TCK --repo Qwen/Qwen3-4B --revision $MM_REV1 --layers $TCL --tk $TCT --seq 512"
@@ -294,5 +294,41 @@ if has trunk_ckpt; then
   done; done
 fi
 has score_trunk_ckpt && python3 "$ROOT/h100/trunk_ckpt_score.py" "$OUT" ${PYTORCH_DEDICATED_STEPS_S:+--pytorch-dedicated-steps-s $PYTORCH_DEDICATED_STEPS_S}
+# ---- real-tail / tc-attention tracks: run only if the real-trunk cut-hidden gate passed (TRUNK_CKPT_SUMMARY; FORCE_UNGATED=1 overrides) ----
+TCKS=${TRUNK_CKPT_SUMMARY:-$ROOT/h100/results/trunk_ckpt/trunk_ckpt_summary.json}
+ckpt_gate() { [ "${FORCE_UNGATED:-0}" = 1 ] && return 0
+  python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["gates"]["hf_cut_hidden"] else 1)' "$TCKS" 2>/dev/null \
+    || { echo "SKIP $1: $TCKS missing or hf_cut_hidden gate failed"; return 1; }; }
+TCB="--trunk-ckpt $TCK --trunk-layers $TCL --tokens $TCT --seq 512"
+TCPREP="$MM_PIP && python h100/mm_prep.py --repo Qwen/Qwen3-4B --revision $MM_REV1 --out $TCK && python h100/trunk_prep.py --repo Qwen/Qwen3-4B --revision $MM_REV1 --model-dir $TCK --tokens $((4 * TCT))"
+# real top-layer tail (--tail real): layer-35 fwd/bwd + tied lm_head + CE on training_prefix rows; first 16 losses vs PREFIX_RUN dedicated arms (1e-3 rel)
+TTN=${TAIL_JOBS:-8 16 32}; TTS=${TAIL_STEPS:-50}
+if has trunk_tail && ckpt_gate trunk_tail; then
+  [ -n "${PREFIX_RUN:-}" ] && [ -f "$PREFIX_RUN/config.json" ] || { echo "PREFIX_RUN must be the audited training_prefix run dir (config.json, summary.json)"; exit 2; }
+  TBD=${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}; TTM=$(echo $TTN | tr ' ' '\n' | sort -n | tail -1)
+  mkdir -p "$OUT/ttl/data"
+  dk $PT_IMG ttl_prep.log -v "$HFC":/root/.cache/huggingface -v "$TBD":/tbd:ro -v "$PREFIX_RUN":/prefix:ro -e HF_TOKEN -- \
+    "$TCPREP && python h100/tail_prep.py --data /tbd --prefix-run /prefix --out /out/ttl/data --steps $TTS --jobs $TTM"
+  TTA="$TCB --tail real --tail-data /out/ttl/data --attn ${TRUNK_ATTN:-cuda}"
+  ttd() { mkdir -p "$OUT/ttl/$1"; local n=$1; shift; dk $PT_IMG ttl_$n.log "$@"; }
+  for J in $(seq 0 $((TTM - 1))); do ttd solo16_j$J -- "timeout -k 10 1800 $TR --mode train --jobs 1 --job-base $J $TTA --steps 16 --dump /out/ttl/solo16_j$J"; done
+  dcgm_on ttl_solo_j0; ttd solo_j0 -- "timeout -k 10 3600 $TR --mode train --jobs 1 $TTA --steps $TTS"; dcgm_off
+  for N in $TTN; do for A in shared perjob; do
+    ttd ${A}16_n$N -- "timeout -k 10 3600 $TR --mode train --jobs $N --trunk $A $TTA --steps 16 --dump /out/ttl/${A}16_n$N"
+    dcgm_on ttl_${A}_n$N; ttd ${A}_n$N -- "timeout -k 10 7200 $TR --mode train --jobs $N --trunk $A $TTA --steps $TTS"; dcgm_off
+  done; done
+fi
+has score_trunk_tail && python3 "$ROOT/h100/trunk_tail_score.py" "$OUT" ${PREFIX_RUN:+--prefix-run "$PREFIX_RUN" --dedicated-rate-from "$PREFIX_RUN/summary.json"}
+# tensor-core attention (--attn tc) vs CUDA-core: cut hidden vs HF fp32 (declared tolerance), bitwise tc==cuda reported, trunk steps/s
+if has trunk_attn && ckpt_gate trunk_attn; then
+  dk $PT_IMG tca_prep.log -v "$HFC":/root/.cache/huggingface -e HF_TOKEN -- "$TCPREP"
+  for AT in cuda tc; do
+    mkdir -p "$OUT/tca/$AT"
+    dk $PT_IMG tca_$AT.log -- "timeout -k 10 900 $TR --mode train --jobs 1 $TCB --attn $AT --steps 1 --dump /out/tca/$AT"
+    dk $PT_IMG tca_hf_$AT.log -v "$HFC":/root/.cache/huggingface -e HF_TOKEN -- "$MM_PIP && python h100/trunk_ckpt_ref.py --out /out/tca/$AT --model-dir $TCK --repo Qwen/Qwen3-4B --revision $MM_REV1 --layers $TCL --tk $TCT --seq 512"
+    dcgm_on tca_$AT; dk $PT_IMG tca_rate_$AT.log -- "timeout -k 10 1800 $TR --mode train --jobs 1 $TCB --attn $AT --steps $TCS"; dcgm_off
+  done
+fi
+has score_trunk_attn && python3 "$ROOT/h100/trunk_attn_score.py" "$OUT"
 has score && python3 "$ROOT/h100/score.py" "$OUT" ${COSCHED_SUMMARY:+--cosched-summary "$COSCHED_SUMMARY"}
 echo "artifacts: $OUT"
