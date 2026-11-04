@@ -31,6 +31,15 @@ busy=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader)
 { nvidia-smi -i "$GPU" --query-gpu=name,driver_version,compute_cap,memory.total --format=csv
   echo "fork_sha $(git -C "$ROOT" rev-parse HEAD)"; echo "upstream_sha 9dd7dd0d3c1fc0245b43897eacd8d62aa096c4c1"
   echo "split train=$TRAIN infer=$INFER doom=0 mps_pct train=$TRAIN_PCT infer=$INFER_PCT steps=$STEPS"; } | tee "$OUT/meta.txt"
+# preflight: 60 s from launcher start (host-enforced), before any arm; fails closed with OUT/preflight.json (h100/preflight.py)
+if has preflight; then
+  PFD=${PREFLIGHT_DEADLINE_S:-60}; PFL=$((PFD - SECONDS)); PFJ=0
+  if has trunk_tail || has codec || has trunk_bwd; then for v in ${TAIL_JOBS:-8 16 32} ${CODEC_JOBS:-16} ${TRUNK_BWD_JOBS:-8}; do [ "$v" -gt "$PFJ" ] && PFJ=$v; done; fi
+  [ "$PFL" -gt 0 ] && timeout -k 5 "$PFL" python3 "$ROOT/h100/preflight.py" --out "$OUT" --gpu "$GPU" --img "$PT_IMG" --sudo "$SUDO" --deadline-s "$PFL" \
+    --jobs "$PFJ" ${PREFIX_RUN:+--prefix-run "$PREFIX_RUN"} --train-data "${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}" \
+    --hf-cache "${HF_CACHE:-$HOME/.cache/huggingface}" --revision 1cfa9a7208912126459214e8b04321603b3df60c --data "$DATA" \
+    || { echo "preflight failed (see $OUT/preflight.json)"; exit 7; }
+fi
 # dk IMG LOG [docker args...] -- cmd   (cmd runs under bash -c, cwd /src)
 dk() { local img=$1 log=$2; shift 2; local extra=(); while [ "$1" != -- ]; do extra+=("$1"); shift; done; shift
   $SUDO docker run --rm --gpus "\"device=$GPU\"" --ipc=host --entrypoint bash -e HOME=/root -e DATA_DIR=/root/data -e MODEL=S \
