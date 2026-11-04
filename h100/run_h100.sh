@@ -12,6 +12,8 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd); GPU=${GPU:-0}; STEPS=${STEPS:-4000}; SUDO=${SUDO-sudo}
 OUT=$(realpath -m "${OUT:-$ROOT/h100/results/run_$(date +%Y%m%d_%H%M%S)}"); DATA=$(realpath -m "${DATA:-$HOME/ofa_data}")
 MPSDIR=/tmp/ofa_mps_$GPU; mkdir -p "$OUT" "$DATA" "$MPSDIR/pipe" "$MPSDIR/log"
+# private empty MPS pipe dir for every process of this run: nothing can attach to another tenant's host MPS daemon (recorded in preflight.json)
+PMPS=$OUT/mps_private_pipe; mkdir -p "$PMPS"; export CUDA_MPS_PIPE_DIRECTORY=$PMPS
 PHASES=${PHASES:-"prep build build_wg gemm_wg mk_train mk_split mk_paced mk_dyn mk_wg pt_full pt_graph serve_full serve_mps mps_pair score"}
 TOTAL=$(nvidia-smi -i "$GPU" --query-gpu=name --format=csv,noheader | grep -q H100 && echo 132 || echo 0)
 [ "$TOTAL" = 132 ] || { echo "GPU $GPU is not an H100"; exit 2; }
@@ -35,7 +37,7 @@ busy=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader)
 if has preflight; then
   PFD=${PREFLIGHT_DEADLINE_S:-60}; PFL=$((PFD - SECONDS)); PFJ=0
   if has trunk_tail || has codec || has trunk_bwd; then for v in ${TAIL_JOBS:-8 16 32} ${CODEC_JOBS:-16} ${TRUNK_BWD_JOBS:-8}; do [ "$v" -gt "$PFJ" ] && PFJ=$v; done; fi
-  [ "$PFL" -gt 0 ] && timeout -k 5 "$PFL" python3 "$ROOT/h100/preflight.py" --out "$OUT" --gpu "$GPU" --img "$PT_IMG" --sudo "$SUDO" --deadline-s "$PFL" \
+  [ "$PFL" -gt 0 ] && timeout -k 5 "$PFL" python3 "$ROOT/h100/preflight.py" --out "$OUT" --gpu "$GPU" --img "$PT_IMG" --sudo "$SUDO" --deadline-s "$PFL" --mps-pipe "$PMPS" \
     --jobs "${PREFIX_JOBS:-$PFJ}" ${PREFIX_RUN:+--prefix-run "$PREFIX_RUN"} --train-data "${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}" \
     --hf-cache "${HF_CACHE:-$HOME/.cache/huggingface}" --revision 1cfa9a7208912126459214e8b04321603b3df60c --data "$DATA" \
     || { echo "preflight failed (see $OUT/preflight.json)"; exit 7; }
@@ -43,7 +45,7 @@ fi
 # dk IMG LOG [docker args...] -- cmd   (cmd runs under bash -c, cwd /src)
 dk() { local img=$1 log=$2 t0; t0=$(date +%s.%N); shift 2; local extra=(); while [ "$1" != -- ]; do extra+=("$1"); shift; done; shift
   $SUDO docker run --rm --gpus "\"device=$GPU\"" --ipc=host --entrypoint bash -e HOME=/root -e DATA_DIR=/root/data -e MODEL=S \
-    -e TOTAL_SMS=$TOTAL -e TRAIN_SMS=$TRAIN -e INFER_SMS=$INFER -e PYTHONUNBUFFERED=1 -v "$ROOT":/src -v "$DATA":/root/data -v "$OUT":/out \
+    -e TOTAL_SMS=$TOTAL -e TRAIN_SMS=$TRAIN -e INFER_SMS=$INFER -e PYTHONUNBUFFERED=1 -e CUDA_MPS_PIPE_DIRECTORY=/mps_private -v "$PMPS":/mps_private:ro -v "$ROOT":/src -v "$DATA":/root/data -v "$OUT":/out \
     "${extra[@]}" -w /src "$img" -c "$*" > "$OUT/$log" 2>&1; local rc=$?
   printf 'start %s\nend %s\nrc %s\n' "$t0" "$(date +%s.%N)" "$rc" > "$OUT/${log%.log}.wall"; echo "$log rc=$rc: $(tail -1 "$OUT/$log" | cut -c1-160)"; return $rc; }
 MPS_ENV=(-e CUDA_MPS_PIPE_DIRECTORY=/mps/pipe -v "$MPSDIR":/mps)

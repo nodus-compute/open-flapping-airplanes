@@ -1,7 +1,9 @@
 """60 s in-run preflight for the real-model OFA chain (trunk_ckpt -> trunk_tail -> codec), run before any arm.
 
 python3 h100/preflight.py --out OUT --gpu G --img PT_IMG [...] -> OUT/preflight.json; exit 0 only if every check passes.
-Checks: H100 80GB HBM3, driver >= 580, free MiB, no other compute apps, no MPS control daemon, pinned image present
+Checks: H100 80GB HBM3, driver >= 580, free MiB, no other compute apps, MPS per device (no nvidia-cuda-mps-server on OUR GPU UUID,
+no CUDA_MPS_* in our env other than the private pipe, private --mps-pipe dir exists and is empty, compute mode Default; another
+tenant's MPS control daemon on a different GPU is recorded, not failed), pinned image present
 locally, a real CUDA matmul + nvcc inside the image on this GPU, PREFIX_RUN config/summary/dedicated-0..J-1,
 train.jsonl, Qwen3-4B revision reachable (HF cache snapshot or HTTP), and free disk under DATA and OUT.
 """
@@ -43,6 +45,7 @@ def main():
     ap.add_argument("--repo", default="Qwen/Qwen3-4B")
     ap.add_argument("--revision", default="")
     ap.add_argument("--data", default="")
+    ap.add_argument("--mps-pipe", default="", help="private empty CUDA_MPS_PIPE_DIRECTORY our processes run with")
     ap.add_argument("--min-disk-gib", type=float, default=30.0)
     a = ap.parse_args()
     left = lambda: a.deadline_s - (time.monotonic() - T0)  # noqa: E731
@@ -59,8 +62,19 @@ def main():
     check("free_mib", len(f) == 3 and f[2].isdigit() and int(f[2]) >= a.min_free_mib, o)
     rc, o = sh(["nvidia-smi", "-i", a.gpu, "--query-compute-apps=pid", "--format=csv,noheader"], 10)
     check("gpu_idle", rc == 0 and not o, o)
-    rc, o = sh(["pgrep", "-f", "nvidia-cuda-mps-control"], 5)
-    check("no_mps_daemon", rc == 1, o)
+    rc, o = sh(["nvidia-smi", "-i", a.gpu, "--query-gpu=uuid,compute_mode", "--format=csv,noheader"], 10)
+    g = [x.strip() for x in o.split(",")] if rc == 0 else []
+    uuid = g[0] if len(g) == 2 and g[0].startswith("GPU-") else ""
+    check("compute_mode_default", len(g) == 2 and g[1] == "Default", o)
+    rc, o = sh(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader"], 10)
+    mine = [ln for ln in o.splitlines() if uuid and ln.split(",")[0].strip() == uuid] if rc == 0 else []
+    check("no_mps_server_on_gpu", rc == 0 and bool(uuid) and not any("nvidia-cuda-mps-server" in ln for ln in mine), {"uuid": uuid, "apps_on_gpu": mine})
+    pipe = os.path.realpath(a.mps_pipe) if a.mps_pipe else ""
+    env_bad = {k: v for k, v in os.environ.items() if k.startswith("CUDA_MPS_") and not (k == "CUDA_MPS_PIPE_DIRECTORY" and pipe and os.path.realpath(v) == pipe)}
+    check("no_mps_env", not env_bad, env_bad)
+    check("private_mps_pipe_empty", bool(pipe) and os.path.isdir(pipe) and not os.listdir(pipe), pipe)
+    rc, o = sh(["pgrep", "-af", "nvidia-cuda-mps-control"], 5)
+    host_mps = o if rc == 0 else ""
 
     rc, o = sh(sudo + ["docker", "image", "inspect", "--format", "{{.Id}}", a.img], 15)
     check("image_local", rc == 0, o)
@@ -69,7 +83,8 @@ def main():
               "torch.cuda.synchronize();y=(x@x).float().abs().sum().item();torch.cuda.synchronize();"
               "print('MATMUL_OK',torch.cuda.get_device_name(0),y==y);"
               "print(subprocess.run(['nvcc','--version'],capture_output=True,text=True).stdout.splitlines()[-1])")
-        rc, o = sh(sudo + ["docker", "run", "--rm", "--gpus", f'"device={a.gpu}"', "--entrypoint", "python", a.img, "-c", py],
+        mps = ["-e", "CUDA_MPS_PIPE_DIRECTORY=/mps_private", "-v", f"{pipe}:/mps_private:ro"] if pipe else []
+        rc, o = sh(sudo + ["docker", "run", "--rm", "--gpus", f'"device={a.gpu}"', *mps, "--entrypoint", "python", a.img, "-c", py],
                    left() - 2)
         check("container_cuda_matmul_nvcc", rc == 0 and "MATMUL_OK" in o and "True" in o and "cuda" in o.lower(), o)
     else:
@@ -105,7 +120,7 @@ def main():
     el = time.monotonic() - T0
     check("within_deadline", el <= a.deadline_s, f"{el:.1f}s <= {a.deadline_s}s")
     passed = all(c["ok"] for c in checks.values())
-    s = {"passed": passed, "elapsed_s": round(el, 2), "deadline_s": a.deadline_s, "gpu": a.gpu, "image": a.img,
+    s = {"passed": passed, "elapsed_s": round(el, 2), "deadline_s": a.deadline_s, "gpu": a.gpu, "gpu_uuid": uuid, "mps_pipe_dir": pipe, "host_mps_control_daemons": host_mps, "image": a.img,
          "failed": [k for k, c in checks.items() if not c["ok"]], "checks": checks}
     Path(a.out, "preflight.json").write_text(json.dumps(s, indent=1))
     print(f"preflight passed={passed} elapsed={el:.1f}s failed={s['failed']}")
