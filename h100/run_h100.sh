@@ -5,6 +5,7 @@
 #   OUT=h100/results/mw PHASES="build_mw mw score_mw" ./h100/run_h100.sh   # multi-workload arm (env MW_INFER_SMS 33, MW_STEPS, MW_DEC_TOKENS, MW_BATCHES "1 8")
 #   OUT=h100/results/ml PHASES="build_ml ml ml_vllm score_ml" ./h100/run_h100.sh   # multi-adapter LoRA decode (SGMV instruction) vs loop / PyTorch / vLLM
 #   OUT=h100/results/sched PHASES="build_sched sched score_sched" ./h100/run_h100.sh   # SLO-aware priority instruction scheduler (env SCHED_RATES "2 4 8 16")
+#   OUT=h100/results/mm PHASES="build_mm mm mm_mps score_mm" ./h100/run_h100.sh   # multi-model decode megakernel (Qwen3-0.6B + Qwen3-4B) vs solo / vLLM MPS
 # env: GPU (0) OUT (h100/results/run_<ts>) DATA (~/ofa_data, cached between runs) STEPS (4000) INFER_SMS (21 = FA's 24/148 of 132)
 #      ALLOW_GPU0 (0: GPU 0 is refused unless 1)  SUDO (sudo) SERVE_RATES ("100 400": open-loop demand in tok/s for mk_paced and mk_dyn)
 set -uo pipefail
@@ -165,5 +166,44 @@ if has sched; then
   done
 fi
 has score_sched && python3 "$ROOT/h100/sched_score.py" "$OUT"
+MMX=/out/mm_h100; MMB=${MM_BATCHES:-1 8 32}; MMT0=${MM_TOKENS_0P6B:-1024}; MMT1=${MM_TOKENS_4B:-256}
+MM_REV0=c1899de289a04d12100db370d81485cdf75e47ca; MM_REV1=1cfa9a7208912126459214e8b04321603b3df60c
+MMD0=/root/data/mm/qwen3_0p6b; MMD1=/root/data/mm/qwen3_4b
+has build_mm && dk $PT_IMG build_mm.log -- "cd llm/h100/mm && nvcc -arch=sm_90a -O3 -std=c++17 --extended-lambda -maxrregcount=128 -Xptxas -v -o $MMX mm.cu"
+MM_PIP="pip install -q numpy safetensors huggingface_hub transformers==4.56.2"
+if has mm; then
+  dk $PT_IMG mm_prep.log -v "$HFC":/root/.cache/huggingface -e HF_TOKEN -- "$MM_PIP && python h100/mm_prep.py --repo Qwen/Qwen3-0.6B --revision $MM_REV0 --out $MMD0 && python h100/mm_prep.py --repo Qwen/Qwen3-4B --revision $MM_REV1 --out $MMD1"
+  MMA="--model0 $MMD0 --model1 $MMD1 --tokens0 $MMT0 --tokens1 $MMT1"
+  for B in $MMB; do
+    for A in solo0 solo1 co; do
+      mkdir -p "$OUT/mm/${A}_b$B"; dcgm_on mm_${A}_b$B
+      dk $PT_IMG mm_${A}_b$B.log -- "timeout -k 10 1200 $MMX --mode $A --b $B $MMA --dump /out/mm/${A}_b$B"; dcgm_off
+    done
+  done
+  dk $PT_IMG mm_ref.log -v "$HFC":/root/.cache/huggingface -- "$MM_PIP && python h100/mm_ref.py --model-dir $MMD0 --dump /out/mm/solo0_b1 --index 0 --out /out/mm_ref_0p6b.json; python h100/mm_ref.py --model-dir $MMD1 --dump /out/mm/solo1_b1 --index 1 --out /out/mm_ref_4b.json"
+fi
+# stock vLLM: each model on a dedicated GPU (one at a time), then both servers under stock MPS (ports 8100 / 8101; 8000 is never used)
+port_busy() { (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null; }
+vstart() { local name=$1 port=$2 repo=$3 rev=$4 util=$5; shift 5
+  [ "$port" != 8000 ] || { echo "refusing port 8000"; return 1; }
+  port_busy "$port" && { echo "refusing: port $port busy"; return 1; }
+  $SUDO docker run -d --rm --name "$name" --gpus "\"device=$GPU\"" --ipc=host --network host -v "$HFC":/root/.cache/huggingface -e HF_TOKEN "$@" \
+    --entrypoint bash $VLLM_IMG -c "vllm serve $repo --revision $rev --served-model-name $name --port $port --gpu-memory-utilization $util --max-model-len 2048 --max-num-seqs 32 --seed 0" >/dev/null || return 1
+  for _ in $(seq 900); do curl -sf "127.0.0.1:$port/health" >/dev/null 2>&1 && return 0; sleep 1; done
+  echo "$name did not come up"; $SUDO docker logs "$name" > "$OUT/vllm_$name.log" 2>&1; return 1; }
+vstop() { $SUDO docker logs "$1" > "$OUT/vllm_$1.log" 2>&1; $SUDO docker rm -f "$1" >/dev/null 2>&1 || true; }
+if has mm_mps; then
+  VB="python3 $ROOT/h100/vllm_mm.py --prompt $DATA/mm/qwen3_4b/prompt.i32 --b $MMB"
+  vstart m1 8100 Qwen/Qwen3-4B $MM_REV1 0.85 && { $VB --server m1:8100:$MMT1 --out "$OUT/mm_vllm_ded_m1.json" > "$OUT/mm_vllm_ded_m1.log" 2>&1; echo "vllm dedicated 4B rc=$?"; }; vstop m1
+  vstart m0 8101 Qwen/Qwen3-0.6B $MM_REV0 0.85 && { $VB --server m0:8101:$MMT0 --out "$OUT/mm_vllm_ded_m0.json" > "$OUT/mm_vllm_ded_m0.log" 2>&1; echo "vllm dedicated 0.6B rc=$?"; }; vstop m0
+  mps_start
+  if vstart m1 8100 Qwen/Qwen3-4B $MM_REV1 0.55 "${MPS_ENV[@]}" && vstart m0 8101 Qwen/Qwen3-0.6B $MM_REV0 0.3 "${MPS_ENV[@]}"; then
+    dcgm_on mm_vllm_mps; $VB --server m0:8101:$MMT0 --server m1:8100:$MMT1 --out "$OUT/mm_vllm_mps.json" > "$OUT/mm_vllm_mps.log" 2>&1; echo "vllm mps rc=$?"; dcgm_off
+  fi
+  vstop m0; vstop m1; mps_stop
+  python3 -c "import json,sys; r=[x for f in sys.argv[2:] for x in json.load(open(f))['rows']]; json.dump({'rows': r}, open(sys.argv[1], 'w'), indent=1)" \
+    "$OUT/mm_vllm.json" $(ls "$OUT"/mm_vllm_ded_m*.json "$OUT"/mm_vllm_mps.json 2>/dev/null)
+fi
+has score_mm && python3 "$ROOT/h100/mm_score.py" "$OUT"
 has score && python3 "$ROOT/h100/score.py" "$OUT" ${COSCHED_SUMMARY:+--cosched-summary "$COSCHED_SUMMARY"}
 echo "artifacts: $OUT"
