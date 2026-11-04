@@ -566,7 +566,7 @@ int main(int argc, char** argv) {
   if (!infer_sms && !infer2_sms && !train_sms_arg) { fprintf(stderr, "no active workload\n"); return 2; }
   const bool doom_on = use_decode && doom_sms > 0 && !no_doom && !wad_path.empty();
   DoomCtx dm{}; unsigned char* fb_host = nullptr; Live* live_host = nullptr;
-  if (!doom_on) CK(cudaDeviceSetLimit(cudaLimitStackSize, 4096));   // perf-build frames are ~1-1.8 KB/thread (spills); Doom setup raises this to 24 KB itself
+  if (!doom_on) CK(cudaDeviceSetLimit(cudaLimitStackSize, duration_s > 0 ? 8192 : 4096));
   if ((doom_on || port > 0) && !doom_host_setup(dm, wad_path, doom_on, fb_host, live_host)) return 1;
   CK(cudaFuncSetAttribute(ofa_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM));
   int occ = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, ofa_kernel, 256, DYN_SMEM));
