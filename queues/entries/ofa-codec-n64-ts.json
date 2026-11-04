@@ -1,0 +1,49 @@
+{
+ "id": "ofa-codec-n64-ts-56b6b48c0ea2",
+ "repo": "nodus-compute/open-flapping-airplanes",
+ "repo_sha": "56b6b48c0ea2a058d99c8d5cc3f20a16fdf73d42",
+ "branch": "devin/1793766400-h100-repro",
+ "gpus": 1,
+ "cwd": "/home/ubuntu/ofa-56b6b48c0ea2",
+ "once": true,
+ "requires_free_gpus": 1,
+ "forbidden_gpu_indices": [
+  0
+ ],
+ "min_free_mib": 70000,
+ "require_gpu_name": "H100 80GB HBM3",
+ "min_driver_major": 580,
+ "sudo": false,
+ "priority": 77,
+ "out": "/home/ubuntu/gpu-queue-runs/ofa-codec-n64-ts-56b6b48c0ea2",
+ "requires_paths": [
+  "/home/ubuntu/ofa-runs/codec-n32-ts-56b6b48c0ea2.passed"
+ ],
+ "argv": [
+  "bash",
+  "-c",
+  "cd /home/ubuntu/ofa-56b6b48c0ea2 && python3 h100/codec_verify.py \"$(cat $HOME/ofa-runs/codec-n32-ts-56b6b48c0ea2.passed)\" > /dev/null || exit 8 && O=$HOME/ofa-runs/codec-n64-ts-56b6b48c0ea2-$(date -u +%Y%m%dT%H%M%SZ) && (GEMM=mma GPU={gpu} OUT=$O DATA=$HOME/ofa_data-codec-n64-ts-56b6b48c0ea2 TRUNK_CKPT_SUMMARY=$O/trunk_ckpt_summary.json TRAIN_BUBBLE_DATA=$HOME/training-bubble-data PREFLIGHT_DEADLINE_S=60 PREFIX_JOBS=32 TRUNK_CKPT_JOBS=1 TRUNK_CKPT_STEPS=4 CODEC_JOBS=64 CODEC_LR_CYCLE=1 CODEC_STEPS=24 CODEC_DEC_TOKENS=2048 CODEC_BATCHES=\"1 8\" CODEC_RESERVE=\"0 16\" CODEC_ATTN_BWD=cuda CODEC_TS=1 PHASES=\"preflight build_trunk trunk_ckpt score_trunk_ckpt codec score_codec\" bash h100/stage_chain.sh --sha 56b6b48c0ea2a058d99c8d5cc3f20a16fdf73d42 --jobs 32 --prefix-run PREFIX_RUN_PATH || true) && python3 h100/codec_verify.py $O > $O/codec_verify.json"
+ ],
+ "prefix_run_arg": "replace PREFIX_RUN_PATH with the audited wall4x training_prefix N32 seed-413 top-layers-1 run dir (dedicated-0..31)",
+ "gates": {
+  "preflight_within_first_seconds": 60,
+  "preflight_before_any_arm": true,
+  "hf_cut_hidden": true,
+  "co_and_ts_decode_tokens_bitwise_vs_solo": true,
+  "co_and_ts_losses_bitwise_vs_dedicated_solo16": true,
+  "codec_p99_tpot_le_x_solo": 1.1,
+  "codec_rates_overlap": true,
+  "one_launch": true,
+  "dcgm_interval_ms": 100,
+  "zero_errors": true,
+  "verifier": "h100/codec_verify.py exit 0 (recomputed from raw counts + billed wall seconds, real-H100 preflight evidence)"
+ },
+ "n64_jobs": "jobs 32..63 reuse the 32 prefix learning rates cyclically (tail_prep --lr-cycle) with their own seed-derived adapter init; dedicated refs are solo16_j0..63",
+ "gated_on": "N32 marker present (requires_paths) and codec_verify.py re-passes on the N32 bundle before any GPU work (exit 8 otherwise)",
+ "reports": [
+  "preflight.json",
+  "trunk_ckpt_summary.json",
+  "codec_summary.json",
+  "codec_verify.json"
+ ]
+}
