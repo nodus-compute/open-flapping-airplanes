@@ -276,5 +276,23 @@ if has dyn; then
   done; done
 fi
 has score_dyn && python3 "$ROOT/h100/dyn_score.py" "$OUT"
+
+# ---- real-model trunk (--trunk-ckpt): Qwen3-4B layers 0..L-1 frozen, tail q/v from layer L, seq 512 x mb 4 per step ----
+TCK=/root/data/mm/qwen3_4b; TCL=${TRUNK_CKPT_LAYERS:-35}; TCT=${TRUNK_CKPT_TOKENS:-2048}; TCN=${TRUNK_CKPT_JOBS:-8 16 32}; TCS=${TRUNK_CKPT_STEPS:-50}
+if has trunk_ckpt; then
+  dk $PT_IMG tck_prep.log -v "$HFC":/root/.cache/huggingface -e HF_TOKEN -- "$MM_PIP && python h100/mm_prep.py --repo Qwen/Qwen3-4B --revision $MM_REV1 --out $TCK && python h100/trunk_prep.py --repo Qwen/Qwen3-4B --revision $MM_REV1 --model-dir $TCK --tokens $((4 * TCT))"
+  TCA="--trunk-ckpt $TCK --trunk-layers $TCL --tokens $TCT --seq 512"
+  tcd() { mkdir -p "$OUT/tck/$1"; local n=$1; shift; dk $PT_IMG tck_$n.log "$@"; }
+  tcd ref1 -- "timeout -k 10 900 $TR --mode train --jobs 1 $TCA --steps 1 --dump /out/tck/ref1"
+  dk $PT_IMG tck_hf.log -v "$HFC":/root/.cache/huggingface -e HF_TOKEN -- "$MM_PIP && python h100/trunk_ckpt_ref.py --out /out/tck/ref1 --model-dir $TCK --repo Qwen/Qwen3-4B --revision $MM_REV1 --layers $TCL --tk $TCT --seq 512"
+  TCM=$(echo $TCN | tr ' ' '\n' | sort -n | tail -1)
+  for J in $(seq 0 $((TCM - 1))); do tcd solo16_j$J -- "timeout -k 10 900 $TR --mode train --jobs 1 --job-base $J $TCA --steps 16 --dump /out/tck/solo16_j$J"; done
+  dcgm_on tck_solo_j0; tcd solo_j0 -- "timeout -k 10 1800 $TR --mode train --jobs 1 $TCA --steps $TCS --dump /out/tck/solo_j0"; dcgm_off
+  for N in $TCN; do for A in shared perjob; do
+    tcd ${A}16_n$N -- "timeout -k 10 1800 $TR --mode train --jobs $N --trunk $A $TCA --steps 16 --dump /out/tck/${A}16_n$N"
+    dcgm_on tck_${A}_n$N; tcd ${A}_n$N -- "timeout -k 10 3600 $TR --mode train --jobs $N --trunk $A $TCA --steps $TCS --dump /out/tck/${A}_n$N"; dcgm_off
+  done; done
+fi
+has score_trunk_ckpt && python3 "$ROOT/h100/trunk_ckpt_score.py" "$OUT" ${PYTORCH_DEDICATED_STEPS_S:+--pytorch-dedicated-steps-s $PYTORCH_DEDICATED_STEPS_S}
 has score && python3 "$ROOT/h100/score.py" "$OUT" ${COSCHED_SUMMARY:+--cosched-summary "$COSCHED_SUMMARY"}
 echo "artifacts: $OUT"

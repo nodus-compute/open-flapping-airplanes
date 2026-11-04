@@ -29,6 +29,7 @@ typedef unsigned long long u64;
 
 constexpr int D = 2560, NQ = 4096, NKV = 1024, NQV = NQ + NKV, NQKV = NQ + 2 * NKV, HD = 128, NKVH = 8, VOC = 151936, R = 8, R2 = 2 * R;
 constexpr int PJ = 2 * R * D + NQV * R;            // per-job fp32 params: Aq[R][D] Av[R][D] Bq[NQ][R] Bv[NKV][R]
+constexpr int TI = 9728;                            // Qwen3-4B MLP width (trunk up/down; real gate/up/down)
 constexpr int MAXB = 8, MAXPOS = 4096, THREADS = 256, ROWS = 16;
 #ifdef MW_GEMM_WG
 constexpr int SMEM = gemm::sm90::smem_bytes() > gemm::smem_bytes() ? gemm::sm90::smem_bytes() : gemm::smem_bytes();
@@ -38,7 +39,7 @@ constexpr int SMEM = gemm::smem_bytes();
 //           // 64 KB
 static_assert(4 * MAXPOS * 4 <= SMEM, "attention scores fit the GEMM smem");
 
-enum Kind { T_BASEQ, T_BASEV, T_DOWN, T_UPG, T_DB, T_DU, T_DA, T_ADAM, T_LOSS, D_DOWN, D_QKV, D_ATT, D_O, D_HEAD, D_NEXT, T_TUP, T_TDN, T_TCV };
+enum Kind { T_BASEQ, T_BASEV, T_DOWN, T_UPG, T_DB, T_DU, T_DA, T_ADAM, T_LOSS, D_DOWN, D_QKV, D_ATT, D_O, D_HEAD, D_NEXT, T_TUP, T_TDN, T_TCV, T_REMB, T_RRMS, T_RQKN, T_RATT, T_RACT };
 struct Ph { int kind, ntasks, tilesM, reps, layer, f32, koff; gemm::Args ga;
 #ifdef MW_GEMM_WG
   const CUtensorMap* tmB; const CUtensorMap* const* tmAx;   // wgmma/TMA backend: B map + one A map per X slot
@@ -54,6 +55,7 @@ struct Ctx {
   // train
   int jobs, tk, nx; float scale, lr, b1, b2, eps, inv;
   const bf16 *X, *Wq, *Wv, *Tq, *Tv; bf16 *Yq, *Yv;
+  const bf16* Remb; const int* rtok; float* rh; bf16 *rqkv, *ratt, *rgu, *ract, *rxn; int rseq; float rms_eps, rtheta;   // --trunk-ckpt real layers
   int L; const u64* arr; u64 *t0, *tmax; u64 max_ns;   // request decode: L tokens/request, Poisson arrivals (ns after t0); per-kind max train-task ns
   int lt; bf16 *Xt[2], *Ht, *junk;   // frozen shared trunk: lt layers, ping-pong outputs, MLP hidden, per-job-arm scratch
   float *P, *G, *M, *Vm, *U, *dO, *dU, *lpart, *loss; u64* step_done;
@@ -119,6 +121,56 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
       gemm::Args a = d.ga; a.A = X;
       gemm::gemm_tile<gemm::NT, gemm::EPI_BF16>(a, local % d.tilesM, local / d.tilesM, smem); break;
 #endif
+    }
+    case T_REMB: {                                             // real trunk: h = embed(tokens of this step's slot), fp32 residual stream
+      const int* tok = C.rtok + (size_t)(step % C.nx) * tk; const size_t i0 = (size_t)local * THREADS * 8;
+      for (int i = 0; i < 8; i++) { const size_t k = i0 + (size_t)i * THREADS + tid; C.rh[k] = bf(C.Remb[(size_t)tok[k / D] * D + k % D]); }
+      break;
+    }
+    case T_RRMS: {                                             // RMSNorm(h) * w -> bf16 (one warp per token row)
+      const int warp = tid >> 5, lane = tid & 31, t = local * 8 + warp; const float* x = C.rh + (size_t)t * D;
+      const bf16* w = d.ga.B; bf16* o = (bf16*)d.ga.C + (size_t)t * D; float ss = 0.f;
+      for (int k = lane; k < D; k += 32) ss = fmaf(x[k], x[k], ss);
+      for (int o2 = 16; o2 > 0; o2 >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o2);
+      const float inv = rsqrtf(ss / D + C.rms_eps);
+      for (int k = lane; k < D; k += 32) o[k] = __float2bfloat16(x[k] * inv * bf(w[k]));
+      break;
+    }
+    case T_RQKN: {                                             // per-head q/k RMSNorm + rotate-half RoPE in place (warp per (token, head))
+      const int warp = tid >> 5, lane = tid & 31, w8 = local * 8 + warp, t = w8 / 40, h = w8 % 40, pos = t % C.rseq;
+      bf16* q = C.rqkv + (size_t)t * NQKV + h * HD; const bf16* nw = d.ga.B + (h < 32 ? 0 : HD);
+      float x[4], ss = 0.f;
+      for (int j = 0; j < 4; j++) { x[j] = bf(q[lane + 32 * j]); ss = fmaf(x[j], x[j], ss); }
+      for (int o2 = 16; o2 > 0; o2 >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o2);
+      const float inv = rsqrtf(ss / HD + C.rms_eps);
+      for (int j = 0; j < 4; j++) x[j] = x[j] * inv * bf(nw[lane + 32 * j]);
+      for (int j = 0; j < 2; j++) { const int dd = lane + 32 * j; const float ang = (float)pos * powf(C.rtheta, -(float)(2 * dd) / (float)HD);
+        const float c = cosf(ang), sn = sinf(ang), a0 = x[j], a1 = x[j + 2]; x[j] = a0 * c - a1 * sn; x[j + 2] = a1 * c + a0 * sn; }
+      for (int j = 0; j < 4; j++) q[lane + 32 * j] = __float2bfloat16(x[j]);
+      break;
+    }
+    case T_RATT: {                                             // causal GQA attention within each seq segment: warp per (query, head), online softmax, fixed key order
+      const int warp = tid >> 5, lane = tid & 31, w8 = local * 8 + warp, t = w8 / 32, h = w8 % 32, g = h / 4, s0 = t - t % C.rseq;
+      const bf16* q = C.rqkv + (size_t)t * NQKV + h * HD; float qv[4], acc[4] = {0.f, 0.f, 0.f, 0.f}, m = -1e30f, l = 0.f;
+      for (int j = 0; j < 4; j++) qv[j] = bf(q[lane + 32 * j]) * 0.08838834764831845f;
+      for (int p = s0; p <= t; p++) {
+        const bf16* k = C.rqkv + (size_t)p * NQKV + NQ + g * HD; float sc = 0.f;
+        for (int j = 0; j < 4; j++) sc = fmaf(qv[j], bf(k[lane + 32 * j]), sc);
+        for (int o2 = 16; o2 > 0; o2 >>= 1) sc += __shfl_xor_sync(0xffffffffu, sc, o2);
+        const float mn = fmaxf(m, sc), cr = __expf(m - mn), e = __expf(sc - mn); l = l * cr + e; m = mn;
+        const bf16* v = k + NKV;
+        for (int j = 0; j < 4; j++) acc[j] = acc[j] * cr + e * bf(v[lane + 32 * j]);
+      }
+      bf16* o = C.ratt + (size_t)t * NQ + h * HD;
+      for (int j = 0; j < 4; j++) o[lane + 32 * j] = __float2bfloat16(acc[j] / l);
+      break;
+    }
+    case T_RACT: {                                             // SwiGLU: act = silu(gate) * up from 64-row interleaved gate/up blocks
+      const size_t i0 = (size_t)local * THREADS * 8;
+      for (int i = 0; i < 8; i++) { const size_t k = i0 + (size_t)i * THREADS + tid, t = k / TI; const int c = (int)(k % TI);
+        const bf16* r = C.rgu + t * 2 * TI + (c / 64) * 128 + c % 64; const float gg = bf(r[0]), uu = bf(r[64]);
+        C.ract[k] = __float2bfloat16(gg / (1.f + __expf(-gg)) * uu); }
+      break;
     }
     case T_TUP: case T_TDN: {                                  // frozen trunk GEMM (K chunk d.koff if split); reps > 1 = per-job arm (rep > 0 writes scratch)
       const int base = d.ntasks / d.reps, rep = local / base, l2 = local % base, x0 = d.kind == T_TUP && !d.layer;
@@ -458,20 +510,20 @@ static void pct(std::vector<double> v, double& p50, double& p99) { if (v.empty()
 int main(int argc, char** argv) {
   std::string mode_s = "co", dir; int jobs = 16, tk = 512, steps = 16, b = 1, ctx0 = 1024, dtok = 2048, infer_sms = 33, nx = 4, lend = 0; u64 seed = 1234;
   int lt = 0, jb = 0; std::string trunk_s = "shared";
-  int nreq = 64, Lr = 64, kc = 0; double rate = 0, max_s = 0; std::string split_s = "static";
+  int nreq = 64, Lr = 64, kc = 0, rseq = 512; std::string ckpt; double rate = 0, max_s = 0; std::string split_s = "static";
   for (int i = 1; i < argc; i++) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s) && i + 1 < argc; };
     if (is("--mode")) mode_s = argv[++i]; else if (is("--jobs")) jobs = atoi(argv[++i]); else if (is("--tokens")) tk = atoi(argv[++i]);
     else if (is("--steps")) steps = atoi(argv[++i]); else if (is("--b")) b = atoi(argv[++i]); else if (is("--ctx")) ctx0 = atoi(argv[++i]);
     else if (is("--dec-tokens")) dtok = atoi(argv[++i]); else if (is("--infer-sms")) infer_sms = atoi(argv[++i]); else if (is("--dump")) dir = argv[++i];
     else if (is("--sm-split")) split_s = argv[++i]; else if (is("--rate")) rate = atof(argv[++i]); else if (is("--nreq")) nreq = atoi(argv[++i]);
-    else if (is("--req-tokens")) Lr = atoi(argv[++i]); else if (is("--trunk-kchunk")) kc = atoi(argv[++i]); else if (is("--max-seconds")) max_s = atof(argv[++i]);
+    else if (is("--req-tokens")) Lr = atoi(argv[++i]); else if (is("--trunk-kchunk")) kc = atoi(argv[++i]); else if (is("--trunk-ckpt")) ckpt = argv[++i]; else if (is("--seq")) rseq = atoi(argv[++i]); else if (is("--max-seconds")) max_s = atof(argv[++i]);
     else if (is("--trunk-layers")) lt = atoi(argv[++i]); else if (is("--trunk")) trunk_s = argv[++i]; else if (is("--job-base")) jb = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--lend")) lend = 1; else if (is("--seed")) seed = atoll(argv[++i]); else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
   }
   if (rate > 0) dtok = nreq * Lr;
   const int mode = mode_s == "train" ? 0 : mode_s == "dec" ? 1 : mode_s == "co" ? 2 : -1;
-  if (lt < 0 || lt > 64 || jb < 0 || (trunk_s != "shared" && trunk_s != "perjob") || (split_s != "static" && split_s != "dynamic") || (rate > 0 && (nreq < 1 || Lr < 2)) || kc < 0) { fprintf(stderr, "bad --trunk-layers (0..64) / --trunk shared|perjob / --job-base\n"); return 2; }
+  if (lt < 0 || lt > 64 || jb < 0 || (trunk_s != "shared" && trunk_s != "perjob") || (split_s != "static" && split_s != "dynamic") || (rate > 0 && (nreq < 1 || Lr < 2)) || kc < 0 || (!ckpt.empty() && (lt < 1 || rseq < 1 || tk % rseq))) { fprintf(stderr, "bad --trunk-layers (0..64) / --trunk shared|perjob / --job-base\n"); return 2; }
   if (mode < 0 || jobs < 1 || jobs > THREADS || tk % 128 || b < 1 || b > MAXB || ctx0 < 1 || steps < 1 || (mode != 0 && ctx0 + (rate > 0 ? Lr : dtok) > MAXPOS)) {
     fprintf(stderr, "bad args: --mode train|dec|co, --tokens multiple of 128, 1<=b<=8, ctx+dec-tokens<=%d\n", MAXPOS); return 2; }
   cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, 0)); const int nsm = prop.multiProcessorCount;
@@ -505,7 +557,31 @@ int main(int argc, char** argv) {
   // train state
   C.X = fb((size_t)nx * tk * D, 4, 1.7320508f); C.Tq = fb((size_t)tk * NQ, 5, 1.7320508f); C.Tv = fb((size_t)tk * NKV, 6, 1.7320508f);
   C.Yq = dalloc<bf16>((size_t)tk * NQ); C.Yv = dalloc<bf16>((size_t)tk * NKV);
-  constexpr int TI = 9728;                                   // Qwen3-4B MLP width: trunk layer = frozen up [TI][D] then down [D][TI] GEMM
+  static_assert(TI == 9728, "Qwen3-4B MLP width");
+  // --trunk-ckpt DIR (h100/mm_prep.py layout): real Qwen3-4B layers [0, lt) as the frozen trunk; the tail's base q/v = layer lt's real q/v
+  size_t lst = 0; const bf16* RW = nullptr;
+  if (!ckpt.empty()) {
+    FILE* f = fopen((ckpt + "/meta.txt").c_str(), "r"); int H, Lm, NH, NKVm, I, V, P; float eps, theta;
+    if (!f || fscanf(f, "%d %d %d %d %d %d %d %f %f", &H, &Lm, &NH, &NKVm, &I, &V, &P, &eps, &theta) != 9) { fprintf(stderr, "cannot read %s/meta.txt\n", ckpt.c_str()); return 2; }
+    fclose(f);
+    if (H != D || NH * HD != NQ || NKVm * HD != NKV || I != TI || lt >= Lm) { fprintf(stderr, "checkpoint shape mismatch (need Qwen3-4B, trunk-layers < %d)\n", Lm); return 2; }
+    lst = (size_t)D + (size_t)NQKV * D + 2 * HD + (size_t)D * NQ + D + (size_t)2 * TI * D + (size_t)D * TI;
+    const size_t total = (size_t)V * D + D + (size_t)(lt + 1) * lst; bf16* w = dalloc<bf16>(total);
+    FILE* wf = fopen((ckpt + "/weights.bf16").c_str(), "rb"); if (!wf) { fprintf(stderr, "cannot open %s/weights.bf16\n", ckpt.c_str()); return 2; }
+    std::vector<bf16> buf(1 << 26); size_t off = 0;
+    while (off < total) { const size_t n = std::min(buf.size(), total - off); if (fread(buf.data(), 2, n, wf) != n) { fprintf(stderr, "short weights file\n"); return 2; }
+      CK(cudaMemcpy(w + off, buf.data(), n * 2, cudaMemcpyHostToDevice)); off += n; }
+    fclose(wf);
+    std::vector<int> tok((size_t)nx * tk); FILE* tf = fopen((ckpt + "/train_tokens.i32").c_str(), "rb");
+    if (!tf || fread(tok.data(), 4, tok.size(), tf) != tok.size()) { fprintf(stderr, "cannot read %zu tokens from %s/train_tokens.i32\n", tok.size(), ckpt.c_str()); return 2; }
+    fclose(tf); for (int t : tok) if (t < 0 || t >= V) { fprintf(stderr, "token id out of range\n"); return 2; }
+    int* dt = dalloc<int>(tok.size()); CK(cudaMemcpy(dt, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice));
+    C.Remb = w; RW = w + (size_t)V * D + D; C.rtok = dt; C.rseq = rseq; C.rms_eps = eps; C.rtheta = theta;
+    C.rh = dalloc<float>((size_t)tk * D); C.rxn = dalloc<bf16>((size_t)tk * D); C.rqkv = dalloc<bf16>((size_t)tk * NQKV);
+    C.ratt = dalloc<bf16>((size_t)tk * NQ); C.rgu = dalloc<bf16>((size_t)tk * 2 * TI); C.ract = dalloc<bf16>((size_t)tk * TI);
+    C.Wq = RW + (size_t)lt * lst + D; C.Wv = C.Wq + (size_t)(NQ + NKV) * D;
+    printf("trunk-ckpt %s: real layers 0..%d, tail q/v from layer %d, seq %d, eps %g theta %g\n", ckpt.c_str(), lt - 1, lt, rseq, eps, theta);
+  }                                   // Qwen3-4B MLP width: trunk layer = frozen up [TI][D] then down [D][TI] GEMM
   C.lt = lt; const bf16* Wup = lt ? fb((size_t)lt * TI * D, 40, 1.7320508f / sqrtf((float)D)) : nullptr;
   const bf16* Wdn = lt ? fb((size_t)lt * D * TI, 41, 1.7320508f / sqrtf((float)TI)) : nullptr;
   if (lt) { C.Xt[0] = dalloc<bf16>((size_t)tk * D); C.Xt[1] = dalloc<bf16>((size_t)tk * D); C.Ht = dalloc<bf16>((size_t)tk * TI); C.junk = reinterpret_cast<bf16*>(dalloc<float>((size_t)tk * TI)); }
@@ -546,10 +622,10 @@ int main(int argc, char** argv) {
   printf("gemm_backend mma_sync\n");
 #endif
   const int KS1 = kc && D > kc ? D / kc : 1, KS2 = kc && TI > kc ? TI / kc : 1;   // split-K chunks (up K=D, down K=TI): bounds trunk tile time
-  const int T0 = lt * ((KS1 > 1 ? KS1 + 1 : 1) + (KS2 > 1 ? KS2 + 1 : 1)), ADAM = T0 + 7, LOSS = T0 + 8, reps = trunk_s == "perjob" ? jobs : 1;
+  const int T0 = !ckpt.empty() ? (trunk_s == "perjob" ? jobs : 1) * (2 + 9 * lt) : lt * ((KS1 > 1 ? KS1 + 1 : 1) + (KS2 > 1 ? KS2 + 1 : 1)), ADAM = T0 + 7, LOSS = T0 + 8, reps = trunk_s == "perjob" ? jobs : 1;
   int prev = -1;
   auto dep_prev = [&](const Ph& t) { prev = prev < 0 ? Bt.add(t, {make_int2(ADAM, -1)}) : Bt.add(t, {make_int2(prev, 0)}); };
-  for (int l = 0; l < lt; l++) for (int k = 0; k < 2; k++) {   // trunk phases first: tickets are claimed in phase order
+  if (ckpt.empty()) for (int l = 0; l < lt; l++) for (int k = 0; k < 2; k++) {   // trunk phases first: tickets are claimed in phase order
     const int n = k ? D : TI, kk = k ? TI : D, ks = k ? KS2 : KS1, kcs = kk / ks;
     const bf16* A = k ? C.Ht : (l ? C.Xt[l % 2] : C.X); const bf16* Bw = k ? Wdn + (size_t)l * D * TI : Wup + (size_t)l * TI * D;
     bf16* Cb = k ? C.Xt[(l + 1) % 2] : C.Ht;
@@ -567,6 +643,28 @@ int main(int argc, char** argv) {
       dep_prev(t);
     }
     if (ks > 1) { Ph t = mk(T_TCV, tk * n / (THREADS * 8)); t.reps = 1; t.ga.A = reinterpret_cast<const bf16*>(Cf); t.ga.C = Cb; dep_prev(t); }
+  }
+  if (!ckpt.empty()) for (int r = 0; r < reps; r++) {   // real trunk; per-job arm recomputes the whole trunk once per job (identical values)
+    auto ew = [&](int kind, int nt, const bf16* Bp, void* Cp) { Ph t = mk(kind, nt); t.reps = 1; t.ga.B = Bp; t.ga.C = Cp; dep_prev(t); };
+    auto gm = [&](const bf16* A, const bf16* Bp, void* Cp, int n, int k, int f32) {   // f32: C += A B^T into the fp32 residual
+      Ph t = mk(T_TDN, 0); t.layer = 1; t.reps = 1; t.f32 = f32; t.koff = 0;
+      t.ga.A = A; t.ga.B = Bp; t.ga.C = Cp; t.ga.accumulate = f32; t.ga.lda = k; t.ga.ldb = k; t.ga.ldc = n; t.ga.ldaux = 8; t.ga.M = tk; t.ga.N = n; t.ga.K = k;
+      t.tilesM = tk / 128; t.ntasks = (tk / 128) * (n / 128);
+      if (!gemm::args_ok(t.ga)) { fprintf(stderr, "bad real-trunk GEMM args\n"); exit(2); }
+#ifdef MW_GEMM_WG
+      { const CUtensorMap* m0 = gemm::sm90::make_map(A, k, tk, k, 64, 128); const CUtensorMap** dm; CK(cudaMalloc(&dm, sizeof(void*)));
+        CK(cudaMemcpy(dm, &m0, sizeof(void*), cudaMemcpyHostToDevice)); t.tmAx = dm; t.tmB = gemm::sm90::make_map(Bp, k, n, k, 64, 128); }
+#endif
+      dep_prev(t); };
+    ew(T_REMB, tk * D / (THREADS * 8), nullptr, nullptr);
+    for (int l = 0; l < lt; l++) {
+      const bf16* W = RW + (size_t)l * lst; const bf16* Wn = W + D + (size_t)NQKV * D; const bf16* Wo = Wn + 2 * HD; const bf16* Wp = Wo + (size_t)D * NQ;
+      const bf16* Wgu = Wp + D; const bf16* Wd = Wgu + (size_t)2 * TI * D;
+      ew(T_RRMS, tk / 8, W, C.rxn); gm(C.rxn, W + D, C.rqkv, NQKV, D, 0); ew(T_RQKN, tk * 40 / 8, Wn, nullptr); ew(T_RATT, tk * 32 / 8, nullptr, nullptr);
+      gm(C.ratt, Wo, C.rh, D, NQ, 1); ew(T_RRMS, tk / 8, Wp, C.rxn); gm(C.rxn, Wgu, C.rgu, 2 * TI, D, 0);
+      ew(T_RACT, tk * TI / (THREADS * 8), nullptr, nullptr); gm(C.ract, Wd, C.rh, D, TI, 1);
+    }
+    ew(T_RRMS, tk / 8, RW + (size_t)lt * lst, C.Xt[lt % 2]);   // cut: layer lt input_layernorm(h) = tail input
   }
   if (prev != T0 - 1) { fprintf(stderr, "trunk phase count mismatch\n"); return 2; }
   if (lt) { Bt.add(q, {make_int2(LOSS, -1), make_int2(T0 - 1, 0)}); Bt.add(v, {make_int2(LOSS, -1), make_int2(T0 - 1, 0)});
@@ -601,7 +699,7 @@ int main(int argc, char** argv) {
     const double span = (tr_hi - tr_lo) * 1e-9; const int n = sdone - 1 - w0;
     printf("loss job0: step0 %.6f last %.6f (%d steps done)\n", loss[0], loss[(size_t)std::max(sdone - 1, 0) * jobs], sdone);
     if (n > 0) printf("train: steady %.4f ms/step -> %.2f steps/s (%d jobs x %d tokens: %.0f job-tok/s)\n", span * 1e3 / n, n / span, jobs, tk, (double)n * jobs * tk / span);
-    dump(dir, "loss.f32", C.loss, (size_t)steps * jobs); dump(dir, "step_done.u64", C.step_done, (size_t)steps); dump(dir, "P.f32", C.P, (size_t)jobs * PJ); dump(dir, "G.f32", C.G, (size_t)jobs * PJ); dump(dir, "tmax.u64", C.tmax, 32);
+    dump(dir, "loss.f32", C.loss, (size_t)steps * jobs); dump(dir, "step_done.u64", C.step_done, (size_t)steps); dump(dir, "P.f32", C.P, (size_t)jobs * PJ); dump(dir, "G.f32", C.G, (size_t)jobs * PJ); dump(dir, "tmax.u64", C.tmax, 32); if (!ckpt.empty()) dump(dir, "Xt.bf16", C.Xt[lt % 2], (size_t)tk * D);
   }
   if (mode != 0) {
     std::vector<u64> td(dtok); CK(cudaMemcpy(td.data(), C.tok_done, dtok * 8, cudaMemcpyDeviceToHost));
