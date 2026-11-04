@@ -381,6 +381,14 @@ if has codec && ckpt_gate codec; then
       cdd co_b${B}_r$RS$SX -- "timeout -k 10 7200 $TR --mode co --sm-split dynamic --dec real --dec-reserve $RS --jobs $CDN $CTB --b $B --ctx 1 --dec-tokens $CDT --steps $CDS --dump /out/cdc/co_b${B}_r$RS$SX"
       dcgm_off
     done; done
+    # stock baseline: the same decode and training as 2 separate processes time-sliced on this GPU (no MPS); host start/end per process
+    if [ "${CODEC_TS:-1}" = 1 ] && [ -z "$SX" ]; then for B in $CDB; do
+      dcgm_on cdc_ts_b$B
+      ( echo "start $(date +%s.%N)"; cdd ts_dec_b$B -- "timeout -k 10 7200 $TR --mode dec --dec real $CTA --b $B --ctx 1 --dec-tokens $CDT --infer-sms 9999 --dump /out/cdc/ts_dec_b$B"; echo "end $(date +%s.%N)" ) > "$OUT/cdc/ts_dec_b$B.times" 2>&1 &
+      TSD=$!
+      ( echo "start $(date +%s.%N)"; cdd ts_train_b$B -- "timeout -k 10 7200 $TR --mode train --jobs $CDN $CTB --steps $CDS --dump /out/cdc/ts_train_b$B"; echo "end $(date +%s.%N)" ) > "$OUT/cdc/ts_train_b$B.times" 2>&1 &
+      wait $! "$TSD"; dcgm_off
+    done; fi
   done
 fi
 has score_codec && python3 "$ROOT/h100/codec_score.py" "$OUT"
