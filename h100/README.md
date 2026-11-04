@@ -5,31 +5,35 @@ B200 and B300 (`tcgen05`) builds and has no H100 build. This directory runs the 
 `mma.sync` GEMM backend forced with `-DOFA_GEMM_BACKEND=0` (the r2 header defaults to 2, which falls back to mma.sync off sm_100), built for `sm_90a`, Doom compiled out with `NODOOM=1`) on a 132-SM H100. It compares that build with solo and MPS-split
 baselines and scores combined useful work per GPU-second. Nothing here has run on an H100 yet, so there are no measured numbers.
 
-## Command (1x H100; needs docker + nvidia-container-toolkit; the vLLM 0.30 image needs driver >= 580)
+## Launch (1x H100; needs Docker + NVIDIA Container Toolkit; vLLM 0.30 needs driver >= 580)
 ```bash
 git clone -b <branch> https://github.com/nodus-compute/open-flapping-airplanes && cd open-flapping-airplanes
-GPU=0 ALLOW_GPU0=1 ./h100/run_h100.sh                      # everything (GPU 0 needs ALLOW_GPU0=1)
-GPU=0 ALLOW_GPU0=1 PHASES="prep build mk_loss20 mk_train mk_split score" ./h100/run_h100.sh   # megakernel repro only
+GPU=1 MAX_WALL_S=7200 ./h100/run_h100.sh
+# GPU 0 requires ALLOW_GPU0=1 and is always refused on hosts whose name contains deltaft.
+GPU=0 ALLOW_GPU0=1 MAX_WALL_S=7200 ./h100/run_h100.sh
 ```
-Images (pinned): `pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel@sha256:3d614dfd...` builds and runs the megakernel and the PyTorch baselines.
-`vllm/vllm-openai:v0.30.0-x86_64@sha256:5f5e5352...` runs the vLLM baseline. Data (about 1.5 GB) is cached in `$DATA` (default `~/ofa_data`).
-Prep now downloads with Python urllib inside the container, and the run fails closed on missing inputs.
+The default run first builds `ofa-h100:<Dockerfile sha256 prefix>`, derived from the pinned PyTorch image, and then runs the workload phases. Data (about 1.5 GB) is cached in `$DATA` (default `~/ofa_data`). Prep downloads with Python urllib inside the container, and the run fails closed on missing inputs. DCGM profiling is required before workload phases and is never replaced by nvidia-smi.
+
+Exit codes: `3` means a busy GPU or an existing host MPS daemon, `4` means a GPU 0 or port 8000 refusal, `5` means image build, prep, or main build failure, `6` means required data, binaries, or the initialization checksum is missing or invalid, and `7` means DCGM discovery or profiling is unavailable.
 
 ## Arms (model S: 162.4M GPT, 4,000 steps x 4,096 tokens; split 111 train / 21 serve SMs, FA's 24/148 proportion)
 | phase | what |
 |---|---|
+| `image` | Build and validate the derived PyTorch image, including `curl` and `tini`; records the image ID and base digest |
+| `prep` | Download and prepare data and checksummed initialization weights |
+| `build` | Build the H100 `mma.sync` OFA binaries, static and dynamic |
 | `mk_train` | megakernel, training only, all 132 SMs (solo megakernel training) |
 | `mk_split` | megakernel, ONE launch: training on 111 SMs plus decode on 21 SMs from the live weights |
 | `mk_paced` | `mk_split` with an open-loop serving demand of R tok/s (`--serve-rate R`, R in `SERVE_RATES`, default 100 and 400), static split |
 | `mk_dyn` | IMPROVED arm: `mk_paced` plus `--lend`. A serving block whose next token is not yet due claims one training task |
-| `pt_full`, `pt_graph` | PyTorch eager / one CUDA graph per step, full GPU, solo. `pt_full` saves the checkpoint vLLM serves |
+| `pt_full`, `pt_graph`, `mg_solo` | PyTorch eager / one CUDA graph per step and Megatron-Core with Transformer Engine, full GPU, solo. `pt_full` saves the checkpoint vLLM serves |
 | `serve_full`, `serve_mps` | vLLM 0.30 batch-1 decode, 256 tokens, full GPU / MPS 16% |
 | `mps_pair` | FA's baseline style, but MEASURED concurrently: PyTorch CUDA-graph training on MPS 84% plus vLLM on MPS 16%, one host MPS daemon |
 | `build_wg`, `gemm_wg`, `mk_wg` | sm90 wgmma backend build, its GEMM correctness/speed check vs cuBLAS, and the megakernel arms on it (see below) |
 | `score` | `h100/score.py OUT` writes `summary.json` |
 
-Megatron + Transformer Engine needs the TE source build in `llm/b200/baseline/setup_b200.sh` (use `NVTE_CUDA_ARCHS=90`). It is not in the default
-phases. If you run it, write its JSON as `OUT/te_graph.json`; `score.py` then uses it as a solo training baseline.
+DCGM records SM_ACTIVE, PIPE_TENSOR_ACTIVE, and DRAM_ACTIVE at 100 ms. Each scored arm reports per-field means and coverage, and the verdict requires at least 90% coverage for every arm. Megatron-Core 0.16.1 is installed in the pinned NGC 25.09 image for `mg_solo`.
+The WGMMA experiment is opt-in with `PHASES="image prep build build_wg gemm_wg mk_wg score"`; it is kept separate from the default run so its additional arms do not crowd out the scored baseline phases under the wall budget.
 
 ## Improved arm: dynamic SM split driven by the serving queue (`--serve-rate R --lend`, `ofa_r2.cu`)
 Upstream decodes closed loop: the serve SMs generate tokens back to back, whatever the demand. With `--serve-rate R`, token s is released at
@@ -58,7 +62,7 @@ Upstream has no Hopper GEMM. Its H100 build runs A100-era `mma.sync` GEMMs, whil
 - Status: compiled with nvcc 12.8 for sm_90a but never executed, so expect the first GPU run to find descriptor or layout bugs.
 
 ## Score and gates (pre-registered, `score.py GATES`)
-U = training tok/s / best solo full-GPU training tok/s (max of mk_train, pt_full, pt_graph, te_graph), plus serving tok/s / solo full-GPU vLLM tok/s.
+U = training tok/s / best solo full-GPU training tok/s (max of valid `pt_full`, `pt_graph`, and `mg_solo` results, with the winner recorded), plus serving tok/s / solo full-GPU vLLM tok/s.
 Running the two jobs one after the other gives U = 1.0 (serial). Verdict is true only if a megakernel arm has:
 - U >= 3.0 vs serial
 - U >= 1.5 x the MPS pair's U
@@ -77,6 +81,7 @@ writes `mk_*_loss.txt` and `mk_split_tokens.txt`. `ofa_h100.buildlog` has the pt
 - Runtime: prep about 10 min (download plus tokenization); build about 2 min; each megakernel arm about 2-4 min; each PyTorch run about 3-5 min.
   vLLM startup is about 1-2 min per phase. A full run takes about 40-60 min.
 - `refusing: GPU busy`: pick a free GPU. Never kill other jobs.
+- `dcgm_profiling_unavailable`: inspect the reported host engine, systemd state, and port 5555 status. The system `nvidia-dcgm nv-hostengine` may hold profiling counters, so a private engine can get zero rows. Stop the service yourself or run through the host engine. The harness does not stop system services.
 - Build: `-DGEMM_STAGES=4` (64 KB/block) x 2 blocks fits H100's 228 KB/SM. If the launch fails with too many resources, rebuild with
   `-DOFA_BLOCKS_PER_SM=1`.
 - vLLM image on driver < 580 fails at CUDA init. Use a driver-580 box.

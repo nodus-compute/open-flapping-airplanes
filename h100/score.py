@@ -11,7 +11,15 @@ import math
 import pathlib
 import re
 
-GATES = {"vs_serial_min": 3.0, "vs_mps_min": 1.5, "tpot_slo_ms": 50.0, "slo_attainment_min": 0.99, "loss_delta_max": 0.02, "errors_max": 0}
+GATES = {
+    "vs_serial_min": 3.0,
+    "vs_mps_min": 1.5,
+    "tpot_slo_ms": 50.0,
+    "slo_attainment_min": 0.99,
+    "loss_delta_max": 0.02,
+    "errors_max": 0,
+    "dcgm_coverage_min": 0.9,
+}
 
 
 def parse_mk_log(text):
@@ -50,13 +58,60 @@ def mean(xs):
     return sum(xs) / len(xs) if xs else None
 
 
+def attach_dcgm_metrics(out, arms):
+    marks = {}
+    marks_path = out / "phase_marks.jsonl"
+    if marks_path.exists():
+        for line in marks_path.read_text(errors="replace").splitlines():
+            try:
+                mark = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            marks.setdefault(mark.get("phase"), {})[mark.get("event")] = mark
+    samples = []
+    for line in (out / "dcgm.jsonl").read_text(errors="replace").splitlines() if (out / "dcgm.jsonl").exists() else ():
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if all(sample.get(key) is not None for key in ("sm_active", "pipe_tensor_active", "dram_active")):
+            samples.append(sample)
+    phase_for_arm = {
+        "pt_mps_pair": "mps_pair",
+        "serve_mps_pair": "mps_pair",
+    }
+    for name, arm in arms.items():
+        phase = phase_for_arm.get(name, name)
+        window = marks.get(phase, {})
+        start = window.get("start", {}).get("wall_time")
+        end = window.get("end", {}).get("wall_time")
+        if start is None or end is None or end <= start:
+            arm["dcgm"] = {"coverage": 0.0, "valid_rows": 0, "reason": "phase marks unavailable"}
+            continue
+        rows = [
+            sample for sample in samples
+            if start <= sample.get("wall_time", -1) <= end
+        ]
+        expected = max(1, math.ceil((end - start) * 1000 / 100))
+        metrics = {
+            "coverage": min(1.0, len(rows) / expected),
+            "valid_rows": len(rows),
+            "expected_rows": expected,
+            "mode": json.loads((out / "dcgm_state.json").read_text()).get("mode")
+            if (out / "dcgm_state.json").exists() else None,
+        }
+        for key in ("sm_active", "pipe_tensor_active", "dram_active"):
+            metrics[f"{key}_mean"] = mean([row.get(key) for row in rows])
+        arm["dcgm"] = metrics
+
+
 def collect(out):
     out = pathlib.Path(out)
     arms = {}
     for log in sorted(out.glob("mk_*.log")):
         if log.stem != "mk_loss20":
             arms[log.stem] = parse_mk_log(log.read_text(errors="replace"))
-    for name in ("pt_full", "pt_graph", "te_graph", "pt_mps_pair"):
+    for name in ("pt_full", "pt_graph", "te_graph", "pt_mps_pair", "mg_solo"):
         r = load_json(out / f"{name}.json")
         if r:
             arms[name] = {"train_tok_s": r.get("tok_s"), "train_s": r.get("seconds"), "loss_final": r.get("loss_final"),
@@ -65,19 +120,38 @@ def collect(out):
         r = load_json(out / f"{name}.json")
         if r:
             arms[name] = {"serve_tok_s": mean(r.get("tok_s", [])), "errors": 0}
+    attach_dcgm_metrics(out, arms)
     return arms
 
 
-def summarize(arms, gates=GATES, cosched=None):
+def summarize(arms, gates=GATES, cosched=None, wall_budget=None):
     s = {"gates": gates, "arms": arms, "errors": [], "verdict": False}
-    solo_train = {k: arms[k]["train_tok_s"] for k in ("mk_train", "mk_wg_train", "mk_wg1_train", "pt_full", "pt_graph", "te_graph")
-                  if k in arms and arms[k].get("train_tok_s")}
+    solo_train = {k: arms[k]["train_tok_s"] for k in ("pt_full", "pt_graph", "mg_solo")
+                  if k in arms and arms[k].get("train_tok_s") and arms[k]["train_tok_s"] > 0}
     solo_serve = arms.get("serve_full", {}).get("serve_tok_s")
     if not solo_train:
         s["errors"].append("no solo training baseline")
     if not solo_serve:
         s["errors"].append("no solo vLLM baseline (serve_full)")
+    dcgm_coverage_ok = bool(arms) and all(
+        arm.get("dcgm", {}).get("coverage", 0.0) >= gates["dcgm_coverage_min"]
+        for arm in arms.values()
+    )
+    s["dcgm_coverage_ok"] = dcgm_coverage_ok
+    low_coverage = [
+        f"{name}={arm.get('dcgm', {}).get('coverage', 0.0):.3f}"
+        for name, arm in arms.items()
+        if arm.get("dcgm", {}).get("coverage", 0.0) < gates["dcgm_coverage_min"]
+    ]
+    if low_coverage:
+        s["errors"].append(
+            "DCGM coverage below 90%: " + ", ".join(low_coverage)
+        )
+    budget = wall_budget
+    if budget:
+        s["errors"].append(budget.get("reason", "maximum wall budget exceeded"))
     if s["errors"]:
+        s["verdict"] = False
         return s
     best_train = max(solo_train.values())
     s.update(best_solo_train=max(solo_train, key=solo_train.get), best_solo_train_tok_s=best_train, solo_vllm_tok_s=solo_serve)
@@ -123,7 +197,11 @@ def summarize(arms, gates=GATES, cosched=None):
         if name.startswith("mk_dyn_") and rows.get(twin, {}).get("useful_work"):
             row["vs_static_same_demand"] = row["useful_work"] / rows[twin]["useful_work"]
     s["fused"] = rows
-    s["verdict"] = any(r.get("pass") for r in rows.values())
+    s["verdict"] = (
+        any(r.get("pass") for r in rows.values())
+        and dcgm_coverage_ok
+        and budget is None
+    )
     return s
 
 
@@ -133,7 +211,12 @@ def main(argv=None):
     ap.add_argument("--cosched-summary")
     a = ap.parse_args(argv)
     cos = load_json(a.cosched_summary) if a.cosched_summary else None
-    s = summarize(collect(a.out), GATES, cos)
+    s = summarize(
+        collect(a.out),
+        GATES,
+        cos,
+        load_json(pathlib.Path(a.out) / "wall_budget.json"),
+    )
     pathlib.Path(a.out, "summary.json").write_text(json.dumps(s, indent=1))
     print(json.dumps({k: s.get(k) for k in ("verdict", "fused", "mps_useful_work", "best_solo_train", "errors")}, indent=1))
     return s
