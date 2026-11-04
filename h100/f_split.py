@@ -25,6 +25,15 @@ def rate(ts, per, lo=None, hi=None, skip=1):
     return per * (len(t) - 1) / ((t[-1] - t[0]) * 1e-9) if len(t) >= 2 and t[-1] > t[0] else None
 
 
+def tile_report(p, step_s):
+    """Report-only: per-kind max train-tile ns (tmax.u64, indexed by Ph kind) vs the solo decode token-step interval."""
+    b = (p / "tmax.u64").read_bytes() if (p / "tmax.u64").is_file() else b""
+    tm = {k: v * 1e-3 for k, v in enumerate(struct.unpack(f"{len(b) // 8}Q", b)) if v} if b else {}
+    worst = max(tm.items(), key=lambda kv: kv[1], default=None)
+    return dict(max_tile_us_by_kind=tm or None, worst_tile_kind=worst and worst[0], worst_tile_us=worst and worst[1],
+                worst_tile_vs_solo_token_step=worst[1] * 1e-6 / step_s if worst and step_s else None)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
@@ -50,7 +59,8 @@ def main():
             missing.append(p.name)
         rows.append(dict(arm=p.name, b=b, overlap_s=(hi - lo) * 1e-9 if lo is not None and hi > lo else None, decode_solo_tok_s=ds, decode_co_tok_s=dc,
                          train_alone_steps_s=t_alone, train_co_steps_s=tc, f_decode=fd, f_train=ft,
-                         U=fd + ft if fd is not None and ft is not None else None))
+                         U=fd + ft if fd is not None and ft is not None else None,
+                         **tile_report(p, b / ds if ds else None)))
     ok = [r for r in rows if r["U"] is not None and r["U"] >= a.min_u and r["f_decode"] >= a.min_f_decode]
     best = max((r for r in rows if r["U"] is not None), key=lambda r: r["U"], default=None)
     res = dict(bundle=str(a.out), arms=rows, missing=missing, complete=bool(rows) and not missing, best_arm=best and best["arm"],
