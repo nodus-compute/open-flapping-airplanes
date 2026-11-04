@@ -371,7 +371,7 @@ if has codec && ckpt_gate codec; then
   dk $PT_IMG cdc_prep.log -v "$HFC":/root/.cache/huggingface -v "$TBD":/tbd:ro -v "$PREFIX_RUN":/prefix:ro -e HF_TOKEN -- \
     "$TCPREP && python h100/tail_prep.py --data /tbd --prefix-run /prefix --out /out/cdc/data --steps $CDS --jobs $CDN ${CODEC_LR_CYCLE:+--lr-cycle} $PFC"
   cdd() { mkdir -p "$OUT/cdc/$1"; local n=$1; shift; dk $PT_IMG cdc_$n.log "$@"; }
-  CTA="$TCB --tail real --tail-data /out/cdc/data --attn ${TRUNK_ATTN:-cuda}"
+  CTA="$TCB --tail real --tail-data /out/cdc/data --attn ${TRUNK_ATTN:-cuda} ${TAIL_LANES:+--tail-lanes $TAIL_LANES}"
   for B in $CDB; do
     dcgm_on cdc_dec_b$B; cdd dec_b$B -- "timeout -k 10 1800 $TR --mode dec --dec real $CTA --b $B --ctx 1 --dec-tokens $CDT --infer-sms 9999 --dump /out/cdc/dec_b$B"; dcgm_off
   done

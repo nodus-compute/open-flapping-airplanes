@@ -743,7 +743,7 @@ static void pct(std::vector<double> v, double& p50, double& p99) { if (v.empty()
 int main(int argc, char** argv) {
   std::string mode_s = "co", dir; int jobs = 16, tk = 512, steps = 16, b = 1, ctx0 = 1024, dtok = 2048, infer_sms = 33, nx = 4, lend = 0; u64 seed = 1234;
   int lt = 0, jb = 0; std::string trunk_s = "shared";
-  int nreq = 64, Lr = 64, kc = 0, rseq = 512; std::string ckpt, attn_s = "cuda", tail_s = "mse", tdata, dec_s = "synth", abwd_s = "cuda"; int dres = 0, dlim = 0, dP = 0, npf = 0; std::string pfdata; double rate = 0, max_s = 0; std::string split_s = "static";
+  int nreq = 64, Lr = 64, kc = 0, rseq = 512; std::string ckpt, attn_s = "cuda", tail_s = "mse", tdata, dec_s = "synth", abwd_s = "cuda"; int dres = 0, dlim = 0, dP = 0, npf = 0, tlanes = 1; std::string pfdata; double rate = 0, max_s = 0; std::string split_s = "static";
   for (int i = 1; i < argc; i++) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s) && i + 1 < argc; };
     if (is("--mode")) mode_s = argv[++i]; else if (is("--jobs")) jobs = atoi(argv[++i]); else if (is("--tokens")) tk = atoi(argv[++i]);
@@ -753,6 +753,7 @@ int main(int argc, char** argv) {
     else if (is("--req-tokens")) Lr = atoi(argv[++i]); else if (is("--trunk-kchunk")) kc = atoi(argv[++i]); else if (is("--trunk-ckpt")) ckpt = argv[++i]; else if (is("--seq")) rseq = atoi(argv[++i]); else if (is("--max-seconds")) max_s = atof(argv[++i]);
     else if (is("--trunk-layers")) lt = atoi(argv[++i]); else if (is("--trunk")) trunk_s = argv[++i]; else if (is("--job-base")) jb = atoi(argv[++i]);
     else if (is("--attn")) attn_s = argv[++i]; else if (is("--dec")) dec_s = argv[++i]; else if (is("--attn-bwd")) abwd_s = argv[++i]; else if (is("--dec-reserve")) dres = atoi(argv[++i]); else if (is("--tail")) tail_s = argv[++i]; else if (is("--tail-data")) tdata = argv[++i];
+    else if (is("--tail-lanes")) tlanes = atoi(argv[++i]);
     else if (is("--prefill-chunks")) npf = atoi(argv[++i]); else if (is("--prefill-data")) pfdata = argv[++i];
     else if (!strcmp(argv[i], "--lend")) lend = 1; else if (is("--seed")) seed = atoll(argv[++i]); else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
   }
@@ -766,6 +767,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "bad --dec synth|real (real needs --trunk-ckpt, no --rate) / --dec-reserve (co + dynamic split only)\n"); return 2; }
   if ((attn_s != "cuda" && !atc) || (tail_s != "mse" && !treal) || (atc && ckpt.empty()) || (treal && (ckpt.empty() || tdata.empty() || (mode != 0 && !dreal) || rseq % 128))) {
     fprintf(stderr, "bad --attn/--tail: tc attention and the real tail need --trunk-ckpt; --tail real needs --tail-data and --mode train\n"); return 2; }
+  if (tlanes < 1 || (tlanes > 1 && !treal)) { fprintf(stderr, "bad --tail-lanes (>= 1, real tail only)\n"); return 2; }
+  const int NL = std::min(tlanes, jobs);   // real-tail scratch lanes: up to NL jobs' top layers in flight
   if (treal) nx = steps;   // one real microbatch per step (training_prefix row order)
   if (lt < 0 || lt > 64 || jb < 0 || (trunk_s != "shared" && trunk_s != "perjob") || (split_s != "static" && split_s != "dynamic") || (rate > 0 && (nreq < 1 || Lr < 2)) || kc < 0 || (!ckpt.empty() && (lt < 1 || rseq < 1 || tk % rseq))) { fprintf(stderr, "bad --trunk-layers (0..64) / --trunk shared|perjob / --job-base\n"); return 2; }
   if (mode < 0 || jobs < 1 || jobs > THREADS || tk % 128 || b < 1 || b > MAXB || ctx0 < 1 || steps < 1 || (mode != 0 && ctx0 + (rate > 0 ? Lr : dtok) > MAXPOS)) {
@@ -854,9 +857,9 @@ int main(int argc, char** argv) {
   for (int j = 0; j < jobs; j++) fill_f32<<<256, 256>>>(C.P + (size_t)j * PJ, 2 * R * D, seed * 977 + jb + j, 1.7320508f / sqrtf((float)D));   // A random, B zero (LoRA init)
   // --tail real: training_prefix tail inputs from h100/tail_prep.py (tokens, shifted labels, LoRA A init, per-job lr); one scratch set, jobs serialized
   C.rlab = nullptr; C.tinv = nullptr; C.lrj = nullptr; C.wd = 0.f;
-  bf16 *Yb = nullptr, *Qpre = nullptr, *Qn = nullptr, *Tatt = nullptr, *Txn = nullptr, *Tgu = nullptr, *Tact = nullptr, *Thf = nullptr, *TdL = nullptr;
-  bf16 *Tdh3b = nullptr, *Tdact = nullptr, *Tdgu = nullptr, *Tdh2b = nullptr, *Tdatt = nullptr;
-  float *Tlse = nullptr, *Th2 = nullptr, *Th3 = nullptr, *TL = nullptr, *Tdhf = nullptr, *Tdh3 = nullptr, *Tdxn = nullptr, *Tdh2 = nullptr;
+  bf16 *Yb = nullptr, *L_Qpre = nullptr, *L_Qn = nullptr, *L_Tatt = nullptr, *L_Txn = nullptr, *L_Tgu = nullptr, *L_Tact = nullptr, *L_Thf = nullptr, *L_TdL = nullptr;
+  bf16 *L_Tdh3b = nullptr, *L_Tdact = nullptr, *L_Tdgu = nullptr, *L_Tdh2b = nullptr, *L_Tdatt = nullptr;
+  float *L_Tlse = nullptr, *L_Th2 = nullptr, *L_Th3 = nullptr, *L_TL = nullptr, *L_Tdhf = nullptr, *L_Tdh3 = nullptr, *L_Tdxn = nullptr, *L_Tdh2 = nullptr;
   if (treal) {
     auto rd = [&](const char* name, void* dst, size_t bytes, size_t skip) { FILE* f = fopen((tdata + "/" + name).c_str(), "rb");
       if (!f || fseek(f, (long)skip, SEEK_SET) || fread(dst, 1, bytes, f) != bytes) { fprintf(stderr, "cannot read %zu bytes at %zu from %s/%s\n", bytes, skip, tdata.c_str(), name); exit(2); }
@@ -871,11 +874,11 @@ int main(int argc, char** argv) {
     float* dti = dalloc<float>(nx); CK(cudaMemcpy(dti, tinv.data(), nx * 4, cudaMemcpyHostToDevice)); C.tinv = dti;
     float* dlr = dalloc<float>(jobs); CK(cudaMemcpy(dlr, lr.data(), jobs * 4, cudaMemcpyHostToDevice)); C.lrj = dlr; C.wd = 0.01f;
     const size_t T = tk;
-    Yb = dalloc<bf16>(T * NQKV); Qpre = dalloc<bf16>(T * NQKV); Qn = dalloc<bf16>(T * NQKV); Tatt = dalloc<bf16>(T * NQ); Tlse = dalloc<float>(T * 32);
-    Th2 = dalloc<float>(T * D); Th3 = dalloc<float>(T * D); Txn = dalloc<bf16>(T * D); Thf = dalloc<bf16>(T * D); Tgu = dalloc<bf16>(T * 2 * TI); Tact = dalloc<bf16>(T * TI);
-    TL = dalloc<float>(T * VOC); TdL = dalloc<bf16>(T * VOC); Tdhf = dalloc<float>(T * D); Tdh3 = dalloc<float>(T * D); Tdh3b = dalloc<bf16>(T * D);
-    Tdact = dalloc<bf16>(T * TI); Tdgu = dalloc<bf16>(T * 2 * TI); Tdxn = dalloc<float>(T * D); Tdh2 = dalloc<float>(T * D); Tdh2b = dalloc<bf16>(T * D); Tdatt = dalloc<bf16>(T * NQ);
-    printf("tail real: %s, %d microbatches, jobs %d..%d, lr %g..%g, AdamW wd 0.01, CE over %d vocab\n", tdata.c_str(), nx, jb, jb + jobs - 1, lr[0], lr[jobs - 1], VOC);
+    Yb = dalloc<bf16>(T * NQKV); L_Qpre = dalloc<bf16>((T * NQKV) * NL); L_Qn = dalloc<bf16>((T * NQKV) * NL); L_Tatt = dalloc<bf16>((T * NQ) * NL); L_Tlse = dalloc<float>((T * 32) * NL);
+    L_Th2 = dalloc<float>((T * D) * NL); L_Th3 = dalloc<float>((T * D) * NL); L_Txn = dalloc<bf16>((T * D) * NL); L_Thf = dalloc<bf16>((T * D) * NL); L_Tgu = dalloc<bf16>((T * 2 * TI) * NL); L_Tact = dalloc<bf16>((T * TI) * NL);
+    L_TL = dalloc<float>((T * VOC) * NL); L_TdL = dalloc<bf16>((T * VOC) * NL); L_Tdhf = dalloc<float>((T * D) * NL); L_Tdh3 = dalloc<float>((T * D) * NL); L_Tdh3b = dalloc<bf16>((T * D) * NL);
+    L_Tdact = dalloc<bf16>((T * TI) * NL); L_Tdgu = dalloc<bf16>((T * 2 * TI) * NL); L_Tdxn = dalloc<float>((T * D) * NL); L_Tdh2 = dalloc<float>((T * D) * NL); L_Tdh2b = dalloc<bf16>((T * D) * NL); L_Tdatt = dalloc<bf16>((T * NQ) * NL);
+    printf("tail real: %s, %d microbatches, jobs %d..%d, lr %g..%g, AdamW wd 0.01, CE over %d vocab, %d scratch lanes\n", tdata.c_str(), nx, jb, jb + jobs - 1, lr[0], lr[jobs - 1], VOC, NL);
   }
   C.G = dalloc<float>((size_t)jobs * PJ); C.M = dalloc<float>((size_t)jobs * PJ); C.Vm = dalloc<float>((size_t)jobs * PJ);
   C.U = dalloc<float>((size_t)jobs * tk * R2); C.dU = dalloc<float>((size_t)jobs * tk * R2); C.dO = dalloc<float>((size_t)jobs * tk * NQV);
@@ -960,12 +963,13 @@ int main(int argc, char** argv) {
   if (lt) { Bt.add(q, {make_int2(LOSS, -1), make_int2(T0 - 1, 0)}); Bt.add(v, {make_int2(LOSS, -1), make_int2(T0 - 1, 0)});
     Bt.add(mk(T_DOWN, rbt), {make_int2(ADAM, -1), make_int2(T0 - 1, 0)}); }
   else { Bt.add(q, {make_int2(LOSS, -1)}); Bt.add(v, {make_int2(LOSS, -1)}); Bt.add(mk(T_DOWN, rbt), {make_int2(ADAM, -1)}); }
+  std::vector<int2> tail_end = {make_int2(T0 + 3 + XT, 0)};   // phases the per-job gradient reductions wait on (every lane's last job)
   if (!treal) Bt.add(mk(T_UPG, rbt), {make_int2(T0 + 0, 0), make_int2(T0 + 1, 0), make_int2(T0 + 2, 0)});
   else {   // real top layer per job (training_prefix tail): forward, lm_head + CE, backward to dq/dv -> dO; jobs chained in order over one scratch set
     const bf16* W = RW + (size_t)lt * lst; const bf16* Wn = W + D + (size_t)NQKV * D; const bf16* Wo = Wn + 2 * HD; const bf16* Wp = Wo + (size_t)D * NQ;
     const bf16* Wgu = Wp + D; const bf16* Wd = Wgu + (size_t)2 * TI * D; const bf16* Wf = C.Remb + (size_t)VOC * D;
-    int cprev = -1, jj = 0;
-    auto chn = [&](Ph t) { t.layer = jj; cprev = cprev < 0 ? Bt.add(t, {make_int2(T0 + 0, 0), make_int2(T0 + 1, 0), make_int2(T0 + 2, 0)}) : Bt.add(t, {make_int2(cprev, 0)}); };
+    int jj = 0; std::vector<std::vector<Ph>> jph(jobs);   // per-job phase lists, added below interleaved across --tail-lanes scratch sets
+    auto chn = [&](Ph t) { t.layer = jj; jph[jj].push_back(t); };
     auto ewj = [&](int kind, int nt, const bf16* A, const bf16* Bp, void* Cp, bf16* aux, float* fx, float* fx2, const bf16* w2) {
       Ph t = mk(kind, nt); t.ga.A = A; t.ga.B = Bp; t.ga.C = Cp; t.ga.aux = aux; t.fx = fx; t.fx2 = fx2; t.w2 = w2; chn(t); };
     auto gmj = [&](int kind, const bf16* A, const bf16* Bp, void* Cp, int n, int k, int f32, int acc) {   // T_TDN: C (+)= A.B^T (B [N][K]); T_GNN: C = A.B (B [K][N])
@@ -979,6 +983,28 @@ int main(int argc, char** argv) {
       chn(t); };
     const int E8 = (int)((size_t)tk * D / (THREADS * 8)), EI = (int)((size_t)tk * TI / (THREADS * 8));
     for (jj = 0; jj < jobs; jj++) {
+      const int ln = jj % NL;
+      bf16* Qpre = L_Qpre + (size_t)ln * ((size_t)tk * NQKV);
+      bf16* Qn = L_Qn + (size_t)ln * ((size_t)tk * NQKV);
+      bf16* Tatt = L_Tatt + (size_t)ln * ((size_t)tk * NQ);
+      float* Tlse = L_Tlse + (size_t)ln * ((size_t)tk * 32);
+      float* Th2 = L_Th2 + (size_t)ln * ((size_t)tk * D);
+      float* Th3 = L_Th3 + (size_t)ln * ((size_t)tk * D);
+      bf16* Txn = L_Txn + (size_t)ln * ((size_t)tk * D);
+      bf16* Thf = L_Thf + (size_t)ln * ((size_t)tk * D);
+      bf16* Tgu = L_Tgu + (size_t)ln * ((size_t)tk * 2 * TI);
+      bf16* Tact = L_Tact + (size_t)ln * ((size_t)tk * TI);
+      float* TL = L_TL + (size_t)ln * ((size_t)tk * VOC);
+      bf16* TdL = L_TdL + (size_t)ln * ((size_t)tk * VOC);
+      float* Tdhf = L_Tdhf + (size_t)ln * ((size_t)tk * D);
+      float* Tdh3 = L_Tdh3 + (size_t)ln * ((size_t)tk * D);
+      bf16* Tdh3b = L_Tdh3b + (size_t)ln * ((size_t)tk * D);
+      bf16* Tdact = L_Tdact + (size_t)ln * ((size_t)tk * TI);
+      bf16* Tdgu = L_Tdgu + (size_t)ln * ((size_t)tk * 2 * TI);
+      float* Tdxn = L_Tdxn + (size_t)ln * ((size_t)tk * D);
+      float* Tdh2 = L_Tdh2 + (size_t)ln * ((size_t)tk * D);
+      bf16* Tdh2b = L_Tdh2b + (size_t)ln * ((size_t)tk * D);
+      bf16* Tdatt = L_Tdatt + (size_t)ln * ((size_t)tk * NQ);
       ewj(T_RQV, (int)((size_t)tk * NQKV / (THREADS * 8)), Yb, nullptr, Qpre, Qn, nullptr, nullptr, nullptr);
       ewj(T_RQKN, tk * 40 / 8, nullptr, Wn, Qn, nullptr, nullptr, nullptr, nullptr);
       ewj(atc ? T_RATTC : T_RATT, atc ? tk / 4 : tk * 32 / 8, Qn, nullptr, Tatt, nullptr, Tlse, nullptr, nullptr);
@@ -1002,12 +1028,22 @@ int main(int argc, char** argv) {
       ewj(atcb ? T_RADQC : T_RADQ, atcb ? tk / 4 : tk * 32 / 8, Qn, Tatt, Qpre, Tdatt, Tlse, nullptr, Wn);
       ewj(atcb ? T_RADVC : T_RADV, atcb ? tk / 16 : tk * NKVH / 8, Qn, nullptr, nullptr, Tdatt, Tlse, nullptr, nullptr);
     }
+    // job j runs on scratch lane j % NL, chained after job j-NL (lane reuse); groups of NL jobs are emitted phase-interleaved so the ticket
+    // order fills one job's phase tail with the next lane's tiles. NL = 1 is the old serial chain (same order, same per-job math)
+    std::vector<int> lastp(NL, -1), pv(jobs, -1);
+    for (int g0 = 0; g0 < jobs; g0 += NL) { const int g1 = std::min(jobs, g0 + NL);
+      for (size_t q2 = 0; q2 < jph[g0].size(); q2++) for (int j = g0; j < g1; j++) {
+        std::vector<int2> dp; if (q2) dp = {make_int2(pv[j], 0)};
+        else { dp = {make_int2(T0 + 0, 0), make_int2(T0 + 1, 0), make_int2(T0 + 2, 0)}; if (lastp[j % NL] >= 0) dp.push_back(make_int2(lastp[j % NL], 0)); }
+        pv[j] = Bt.add(jph[j][q2], dp); }
+      for (int j = g0; j < g1; j++) lastp[j % NL] = pv[j]; }
+    tail_end.clear(); for (int l = 0; l < NL; l++) tail_end.push_back(make_int2(lastp[l], 0));
   }
-  Bt.add(mk(T_DB, jobs * (NQV / THREADS)), {make_int2(T0 + 3 + XT, 0)});
-  Bt.add(mk(T_DU, rbt), {make_int2(T0 + 3 + XT, 0)});
+  Bt.add(mk(T_DB, jobs * (NQV / THREADS)), tail_end);
+  Bt.add(mk(T_DU, rbt), tail_end);
   Bt.add(mk(T_DA, jobs * (D / THREADS)), {make_int2(T0 + 5 + XT, 0)});
   Bt.add(mk(T_ADAM, jobs * (PJ / (THREADS * 4))), {make_int2(T0 + 4 + XT, 0), make_int2(T0 + 6 + XT, 0)});
-  Bt.add(mk(T_LOSS, 1), {make_int2(T0 + 3 + XT, 0)});
+  Bt.add(mk(T_LOSS, 1), tail_end);
   if ((int)Bt.ph.size() != LOSS + 1) { fprintf(stderr, "tail phase count mismatch\n"); return 2; }
   printf("tail %s, attn %s, attn-bwd %s\n", tail_s.c_str(), attn_s.c_str(), abwd_s.c_str());
   printf("trunk: %d frozen layers (%s, k-chunk %d), job-base %d, sm-split %s, kernel launches 1 for %d steps\n", lt, trunk_s.c_str(), kc, jb, split_s.c_str(), steps);
