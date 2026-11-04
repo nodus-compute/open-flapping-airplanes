@@ -184,8 +184,8 @@ phase_begin() {
     return "$SKIP_RC"
   fi
   elapsed=$(elapsed_seconds)
-  if (( elapsed + timeout_s > MAX_WALL_S )); then
-    reason="elapsed ${elapsed}s + phase timeout ${timeout_s}s exceeds MAX_WALL_S=${MAX_WALL_S}s"
+  if (( MAX_WALL_S - elapsed < 120 )); then
+    reason="elapsed ${elapsed}s leaves under 120s of MAX_WALL_S=${MAX_WALL_S}s"
     echo "wall budget: skipping $phase and remaining phases ($reason)" | tee -a "$OUT/console.log" >&2
     python3 - "$OUT/wall_budget.json" "$phase" "$elapsed" "$timeout_s" "$MAX_WALL_S" "$reason" <<'PY'
 import json
@@ -213,6 +213,7 @@ PY
     mark_phase "$phase" skipped "" "$reason"
     return "$SKIP_RC"
   fi
+  (( timeout_s <= MAX_WALL_S - elapsed )) || timeout_s=$(( MAX_WALL_S - elapsed ))
   check_gpu_idle "$phase"
   mark_phase "$phase" start
   CURRENT_PHASE=$phase
@@ -394,7 +395,7 @@ if has image; then
   run_image_phase
 fi
 if has prep; then
-  run_docker_phase prep 600 prep.log "$PT_IMG" -- "python h100/prep.py"
+  run_docker_phase prep 1800 prep.log "$PT_IMG" -- "python h100/prep.py"
 fi
 if has build; then
   run_docker_phase build 300 build.log "$PT_IMG" -- \
@@ -420,36 +421,36 @@ WG_OK=0
   grep -q PASS "$OUT/gemm_wg.log" && ! grep -q FAIL "$OUT/gemm_wg.log" && WG_OK=1
 
 if has mk_loss20; then
-  run_docker_phase mk_loss20 300 mk_loss20.log "$PT_IMG" -- \
+  run_docker_phase mk_loss20 1800 mk_loss20.log "$PT_IMG" -- \
     "$MK --steps 20 $BASE --no-doom --loss-out /out/mk_loss20.txt"
 fi
 if has mk_train; then
-  run_docker_phase mk_train 300 mk_train.log "$PT_IMG" -- \
+  run_docker_phase mk_train 1800 mk_train.log "$PT_IMG" -- \
     "$MK $BASE --no-doom --steps $STEPS --loss-out /out/mk_train_loss.txt"
 fi
 if has mk_split; then
-  run_docker_phase mk_split 300 mk_split.log "$PT_IMG" -- \
+  run_docker_phase mk_split 1800 mk_split.log "$PT_IMG" -- \
     "$MK --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --loss-out /out/mk_split_loss.txt --text-out /out/mk_split_tokens.txt"
 fi
 for R in ${SERVE_RATES:-100 400}; do
   if has mk_paced; then
-    run_docker_phase "mk_paced_$R" 300 "mk_paced_$R.log" "$PT_IMG" -- \
+    run_docker_phase "mk_paced_$R" 1800 "mk_paced_$R.log" "$PT_IMG" -- \
       "${MK}_dyn --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --serve-rate $R --loss-out /out/mk_paced_${R}_loss.txt"
   fi
   if has mk_dyn; then
-    run_docker_phase "mk_dyn_$R" 300 "mk_dyn_$R.log" "$PT_IMG" -- \
+    run_docker_phase "mk_dyn_$R" 1800 "mk_dyn_$R.log" "$PT_IMG" -- \
       "${MK}_dyn --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --serve-rate $R --lend --loss-out /out/mk_dyn_${R}_loss.txt"
   fi
 done
 if [ "$WG_OK" = 1 ] && has mk_wg; then
-  run_docker_phase mk_wg_train 300 mk_wg_train.log "$PT_IMG" -- \
+  run_docker_phase mk_wg_train 1800 mk_wg_train.log "$PT_IMG" -- \
     "${MK}_wg $BASE --no-doom --steps $STEPS --loss-out /out/mk_wg_train_loss.txt"
-  run_docker_phase mk_wg1_train 300 mk_wg1_train.log "$PT_IMG" -- \
+  run_docker_phase mk_wg1_train 1800 mk_wg1_train.log "$PT_IMG" -- \
     "${MK}_wg1 $BASE --no-doom --steps $STEPS --loss-out /out/mk_wg1_train_loss.txt"
-  run_docker_phase mk_wg_split 300 mk_wg_split.log "$PT_IMG" -- \
+  run_docker_phase mk_wg_split 1800 mk_wg_split.log "$PT_IMG" -- \
     "${MK}_wg --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --loss-out /out/mk_wg_split_loss.txt"
   for R in ${SERVE_RATES:-100 400}; do
-    run_docker_phase "mk_wg_dyn_$R" 300 "mk_wg_dyn_$R.log" "$PT_IMG" -- \
+    run_docker_phase "mk_wg_dyn_$R" 1800 "mk_wg_dyn_$R.log" "$PT_IMG" -- \
       "${MK}_wg_dyn --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --serve-rate $R --lend --loss-out /out/mk_wg_dyn_${R}_loss.txt"
   done
 elif has mk_wg; then
@@ -457,25 +458,25 @@ elif has mk_wg; then
 fi
 
 if has pt_full; then
-  run_docker_phase pt_full 300 pt_full.log "$PT_IMG" -- \
+  run_docker_phase pt_full 1800 pt_full.log "$PT_IMG" -- \
     "cd $BL && python train_pytorch.py --steps $STEPS --out /out/pt_full.json --tag full --save $CK"
 fi
 if has pt_graph; then
-  run_docker_phase pt_graph 300 pt_graph.log "$PT_IMG" -- \
+  run_docker_phase pt_graph 1800 pt_graph.log "$PT_IMG" -- \
     "cd $BL && python train_pytorch.py --cuda_graph --steps $STEPS --out /out/pt_graph.json --tag full"
 fi
 if has mg_solo; then
-  run_docker_phase mg_solo 900 mg_solo.log "$MG_IMG" -- \
+  run_docker_phase mg_solo 1800 mg_solo.log "$MG_IMG" -- \
     "pip install --no-cache-dir --no-deps megatron-core==0.16.1 && cd $BL && python megatron_train.py --impl te --steps $STEPS --tag full --out /out/mg_solo.json"
 fi
 if has serve_full || has serve_mps || has mps_pair; then
-  run_docker_phase make_hf 300 make_hf.log "$VLLM_IMG" \
+  run_docker_phase make_hf 900 make_hf.log "$VLLM_IMG" \
     -e VLLM_PORT=8100 -e MASTER_PORT=8101 -- \
     "cd $BL && { [ -d $HF ] || { [ -f $CK ] && python3 make_hf.py $HF $CK || python3 make_hf.py $HF; }; } && ls $HF"
 fi
 SV="cd $BL && VLLM_ENABLE_V1_MULTIPROCESSING=0 python3 serve_vllm.py $HF --new 256"
 if has serve_full; then
-  run_docker_phase serve_full 300 serve_full.log "$VLLM_IMG" \
+  run_docker_phase serve_full 900 serve_full.log "$VLLM_IMG" \
     -e VLLM_PORT=8100 -e MASTER_PORT=8101 -- "$SV --reps 5 --out /out/serve_full.json"
 fi
 if has serve_mps; then
