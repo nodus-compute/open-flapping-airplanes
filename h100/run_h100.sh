@@ -330,5 +330,28 @@ if has trunk_attn && ckpt_gate trunk_attn; then
   done
 fi
 has score_trunk_attn && python3 "$ROOT/h100/trunk_attn_score.py" "$OUT"
+# real Qwen3-4B decode + real-tail shared-trunk training co-executing in ONE launch (--dec real --sm-split dynamic): decode instructions first,
+#   trunk/tail tiles fill idle SMs; --dec-reserve R keeps blocks [0, R) decode-only. Gated on the real-trunk cut-hidden result.
+CDN=${CODEC_JOBS:-16}; CDS=${CODEC_STEPS:-24}; CDT=${CODEC_DEC_TOKENS:-2048}; CDB=${CODEC_BATCHES:-1 8}; CDR=${CODEC_RESERVE:-0 16}
+if has codec && ckpt_gate codec; then
+  [ -n "${PREFIX_RUN:-}" ] && [ -f "$PREFIX_RUN/config.json" ] || { echo "PREFIX_RUN must be the audited training_prefix run dir (config.json, summary.json)"; exit 2; }
+  TBD=${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}; mkdir -p "$OUT/cdc/data"
+  dk $PT_IMG cdc_prep.log -v "$HFC":/root/.cache/huggingface -v "$TBD":/tbd:ro -v "$PREFIX_RUN":/prefix:ro -e HF_TOKEN -- \
+    "$TCPREP && python h100/tail_prep.py --data /tbd --prefix-run /prefix --out /out/cdc/data --steps $CDS --jobs $CDN"
+  CTA="$TCB --tail real --tail-data /out/cdc/data --attn ${TRUNK_ATTN:-cuda}"
+  cdd() { mkdir -p "$OUT/cdc/$1"; local n=$1; shift; dk $PT_IMG cdc_$n.log "$@"; }
+  for J in $(seq 0 $((CDN - 1))); do cdd solo16_j$J -- "timeout -k 10 1800 $TR --mode train --jobs 1 --job-base $J $CTA --steps 16 --dump /out/cdc/solo16_j$J"; done
+  dcgm_on cdc_solo_j0; cdd solo_j0 -- "timeout -k 10 3600 $TR --mode train --jobs 1 $CTA --steps $CDS --dump /out/cdc/solo_j0"; dcgm_off
+  dcgm_on cdc_train; cdd train -- "timeout -k 10 7200 $TR --mode train --jobs $CDN $CTA --steps $CDS --dump /out/cdc/train"; dcgm_off
+  for B in $CDB; do
+    dcgm_on cdc_dec_b$B; cdd dec_b$B -- "timeout -k 10 1800 $TR --mode dec --dec real $CTA --b $B --ctx 1 --dec-tokens $CDT --infer-sms 9999 --dump /out/cdc/dec_b$B"; dcgm_off
+    for RS in $CDR; do
+      dcgm_on cdc_co_b${B}_r$RS
+      cdd co_b${B}_r$RS -- "timeout -k 10 7200 $TR --mode co --sm-split dynamic --dec real --dec-reserve $RS --jobs $CDN $CTA --b $B --ctx 1 --dec-tokens $CDT --steps $CDS --dump /out/cdc/co_b${B}_r$RS"
+      dcgm_off
+    done
+  done
+fi
+has score_codec && python3 "$ROOT/h100/codec_score.py" "$OUT"
 has score && python3 "$ROOT/h100/score.py" "$OUT" ${COSCHED_SUMMARY:+--cosched-summary "$COSCHED_SUMMARY"}
 echo "artifacts: $OUT"

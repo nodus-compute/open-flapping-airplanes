@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "../../gemm/gemm.cuh"
+#include "../mm/mm_decode.cuh"
 #include <random>
 #ifdef MW_GEMM_WG
 #include "../gemm_sm90.cuh"
@@ -40,7 +41,7 @@ constexpr int SMEM = gemm::smem_bytes();
 static_assert(4 * MAXPOS * 4 <= SMEM, "attention scores fit the GEMM smem");
 
 enum Kind { T_BASEQ, T_BASEV, T_DOWN, T_UPG, T_DB, T_DU, T_DA, T_ADAM, T_LOSS, D_DOWN, D_QKV, D_ATT, D_O, D_HEAD, D_NEXT, T_TUP, T_TDN, T_TCV, T_REMB, T_RRMS, T_RQKN, T_RATT, T_RACT,
-  T_RATTC, T_RQV, T_RCP, T_CE, T_RNB, T_RACTB, T_RADQ, T_RADV, T_GNN };
+  T_RATTC, T_RQV, T_RCP, T_CE, T_RNB, T_RACTB, T_RADQ, T_RADV, T_GNN, D_REAL };
 struct Ph { int kind, ntasks, tilesM, reps, layer, f32, koff; gemm::Args ga; float *fx, *fx2; const bf16* w2;
 #ifdef MW_GEMM_WG
   const CUtensorMap* tmB; const CUtensorMap* const* tmAx;   // wgmma/TMA backend: B map + one A map per X slot
@@ -64,6 +65,7 @@ struct Ctx {
   // decode
   int b, ctx0; const bf16 *Wqkv, *Wo, *E; const float* adp;   // adp: one adapter, same layout as P
   float *h, *du, *q, *att, *lmax, *lsum_part, *lsum, *logits0; int *lidx, *toks; bf16 *kc, *vc; u64* tok_done;
+  mmd::Model RM; int dres;   // --dec real: real-weight Qwen3-4B decode (mm_decode.cuh); --dec-reserve: blocks [0, dres) claim decode only
 };
 
 __device__ __forceinline__ u64 gtimer() { u64 t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); return t; }
@@ -413,6 +415,7 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
 
 // ------------------------------------------------------------------------------------------------ decode tasks (one token step)
 __device__ void decode_task(const Ctx& C, const Ph& d, int local, int step, char* smem) {
+  if (d.kind == D_REAL) { mmd::Ph p; p.kind = d.koff; p.ntasks = d.ntasks; p.layer = d.layer; p.norm = d.f32; mmd::decode_task(C.RM, p, local, step, smem); return; }
   float* sm = reinterpret_cast<float*>(smem);
   const int tid = threadIdx.x, b = C.b, pos = C.ctx0 + (C.L ? step % C.L : step);
   const float* Bq = C.adp + 2 * R * D; const float* Bv = Bq + (size_t)NQ * R;
@@ -552,7 +555,7 @@ __device__ int try_claim(const Ctx& C, const Job& J, int dec, char* smem) {
 __device__ void dyn_loop(const Ctx& C, char* smem) {
   for (;;) {
     const int a = try_claim(C, C.dc, 1, smem); if (a == 1) continue;
-    const int b = try_claim(C, C.tr, 0, smem); if (b == 1) continue;
+    const int b = (int)blockIdx.x < C.dres ? 2 : try_claim(C, C.tr, 0, smem); if (b == 1) continue;
     if (a == 2 && b == 2) break;
     if (threadIdx.x == 0) __nanosleep(64);
   }
@@ -656,7 +659,7 @@ static void pct(std::vector<double> v, double& p50, double& p99) { if (v.empty()
 int main(int argc, char** argv) {
   std::string mode_s = "co", dir; int jobs = 16, tk = 512, steps = 16, b = 1, ctx0 = 1024, dtok = 2048, infer_sms = 33, nx = 4, lend = 0; u64 seed = 1234;
   int lt = 0, jb = 0; std::string trunk_s = "shared";
-  int nreq = 64, Lr = 64, kc = 0, rseq = 512; std::string ckpt, attn_s = "cuda", tail_s = "mse", tdata; double rate = 0, max_s = 0; std::string split_s = "static";
+  int nreq = 64, Lr = 64, kc = 0, rseq = 512; std::string ckpt, attn_s = "cuda", tail_s = "mse", tdata, dec_s = "synth"; int dres = 0, dlim = 0, dP = 0; double rate = 0, max_s = 0; std::string split_s = "static";
   for (int i = 1; i < argc; i++) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s) && i + 1 < argc; };
     if (is("--mode")) mode_s = argv[++i]; else if (is("--jobs")) jobs = atoi(argv[++i]); else if (is("--tokens")) tk = atoi(argv[++i]);
@@ -665,13 +668,15 @@ int main(int argc, char** argv) {
     else if (is("--sm-split")) split_s = argv[++i]; else if (is("--rate")) rate = atof(argv[++i]); else if (is("--nreq")) nreq = atoi(argv[++i]);
     else if (is("--req-tokens")) Lr = atoi(argv[++i]); else if (is("--trunk-kchunk")) kc = atoi(argv[++i]); else if (is("--trunk-ckpt")) ckpt = argv[++i]; else if (is("--seq")) rseq = atoi(argv[++i]); else if (is("--max-seconds")) max_s = atof(argv[++i]);
     else if (is("--trunk-layers")) lt = atoi(argv[++i]); else if (is("--trunk")) trunk_s = argv[++i]; else if (is("--job-base")) jb = atoi(argv[++i]);
-    else if (is("--attn")) attn_s = argv[++i]; else if (is("--tail")) tail_s = argv[++i]; else if (is("--tail-data")) tdata = argv[++i];
+    else if (is("--attn")) attn_s = argv[++i]; else if (is("--dec")) dec_s = argv[++i]; else if (is("--dec-reserve")) dres = atoi(argv[++i]); else if (is("--tail")) tail_s = argv[++i]; else if (is("--tail-data")) tdata = argv[++i];
     else if (!strcmp(argv[i], "--lend")) lend = 1; else if (is("--seed")) seed = atoll(argv[++i]); else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
   }
   if (rate > 0) dtok = nreq * Lr;
   const int mode = mode_s == "train" ? 0 : mode_s == "dec" ? 1 : mode_s == "co" ? 2 : -1;
-  const bool treal = tail_s == "real", atc = attn_s == "tc";
-  if ((attn_s != "cuda" && !atc) || (tail_s != "mse" && !treal) || (atc && ckpt.empty()) || (treal && (ckpt.empty() || tdata.empty() || mode != 0 || rseq % 128))) {
+  const bool treal = tail_s == "real", atc = attn_s == "tc", dreal = dec_s == "real";
+  if ((dec_s != "synth" && !dreal) || (dreal && (ckpt.empty() || rate > 0)) || dres < 0 || (dres && (mode != 2 || split_s != "dynamic"))) {
+    fprintf(stderr, "bad --dec synth|real (real needs --trunk-ckpt, no --rate) / --dec-reserve (co + dynamic split only)\n"); return 2; }
+  if ((attn_s != "cuda" && !atc) || (tail_s != "mse" && !treal) || (atc && ckpt.empty()) || (treal && (ckpt.empty() || tdata.empty() || (mode != 0 && !dreal) || rseq % 128))) {
     fprintf(stderr, "bad --attn/--tail: tc attention and the real tail need --trunk-ckpt; --tail real needs --tail-data and --mode train\n"); return 2; }
   if (treal) nx = steps;   // one real microbatch per step (training_prefix row order)
   if (lt < 0 || lt > 64 || jb < 0 || (trunk_s != "shared" && trunk_s != "perjob") || (split_s != "static" && split_s != "dynamic") || (rate > 0 && (nreq < 1 || Lr < 2)) || kc < 0 || (!ckpt.empty() && (lt < 1 || rseq < 1 || tk % rseq))) { fprintf(stderr, "bad --trunk-layers (0..64) / --trunk shared|perjob / --job-base\n"); return 2; }
@@ -694,7 +699,8 @@ int main(int argc, char** argv) {
          prop.name, nsm, nblocks, occ, mode_s.c_str(), jobs, tk, R, steps, b, ctx0, dtok, mode == 0 ? 0 : infer_sms);
 
   Ctx C; memset(&C, 0, sizeof C); C.mode = mode == 2 && split_s == "dynamic" ? 3 : mode; C.infer_sms = infer_sms; C.lend = mode == 2 && lend; C.lent = dalloc<unsigned>(1); C.smid_rank = d_rank; C.finished = dalloc<int>(1);
-  C.t0 = dalloc<u64>(1); C.max_ns = (u64)(max_s * 1e9); C.tmax = dalloc<u64>(32); C.L = rate > 0 ? Lr : 0;
+  if (dres >= nblocks) { fprintf(stderr, "--dec-reserve must be < %d blocks\n", nblocks); return 2; }
+  C.dres = dres; C.t0 = dalloc<u64>(1); C.max_ns = (u64)(max_s * 1e9); C.tmax = dalloc<u64>(32); C.L = rate > 0 ? Lr : 0;
   if (rate > 0) { std::vector<u64> arr(nreq); std::mt19937_64 g(seed * 7 + 11); std::exponential_distribution<double> ex(rate); double t = 0.02;
     for (int k = 0; k < nreq; k++) { t += ex(g); arr[k] = (u64)(t * 1e9); }
     u64* a = dalloc<u64>(nreq); CK(cudaMemcpy(a, arr.data(), nreq * 8, cudaMemcpyHostToDevice)); C.arr = a; }
@@ -717,7 +723,7 @@ int main(int argc, char** argv) {
     fclose(f);
     if (H != D || NH * HD != NQ || NKVm * HD != NKV || I != TI || lt >= Lm) { fprintf(stderr, "checkpoint shape mismatch (need Qwen3-4B, trunk-layers < %d)\n", Lm); return 2; }
     lst = (size_t)D + (size_t)NQKV * D + 2 * HD + (size_t)D * NQ + D + (size_t)2 * TI * D + (size_t)D * TI;
-    const size_t total = (size_t)V * D + D + (size_t)(lt + 1) * lst; bf16* w = dalloc<bf16>(total);
+    const size_t total = (size_t)V * D + D + (size_t)(dreal ? Lm : lt + 1) * lst; bf16* w = dalloc<bf16>(total);
     FILE* wf = fopen((ckpt + "/weights.bf16").c_str(), "rb"); if (!wf) { fprintf(stderr, "cannot open %s/weights.bf16\n", ckpt.c_str()); return 2; }
     std::vector<bf16> buf(1 << 26); size_t off = 0;
     while (off < total) { const size_t n = std::min(buf.size(), total - off); if (fread(buf.data(), 2, n, wf) != n) { fprintf(stderr, "short weights file\n"); return 2; }
@@ -732,6 +738,24 @@ int main(int argc, char** argv) {
     C.ratt = dalloc<bf16>((size_t)tk * NQ); C.rgu = dalloc<bf16>((size_t)tk * 2 * TI); C.ract = dalloc<bf16>((size_t)tk * TI);
     C.Wq = RW + (size_t)lt * lst + D; C.Wv = C.Wq + (size_t)(NQ + NKV) * D;
     printf("trunk-ckpt %s: real layers 0..%d, tail q/v from layer %d, seq %d, eps %g theta %g\n", ckpt.c_str(), lt - 1, lt, rseq, eps, theta);
+    if (dreal) {   // real decode on the same resident weights (all Lm layers): mm.cu's model state, prompt.i32 from mm_prep.py
+      mmd::Model& M = C.RM;
+      if (V != VOC || P + dtok > mmd::SPOS || NH / NKVm > mmd::MAXHPK) { fprintf(stderr, "--dec real: need vocab %d and prompt + dec-tokens <= %d\n", VOC, mmd::SPOS); return 2; }
+      M.H = D; M.L = Lm; M.NH = NH; M.NKV = NKVm; M.I = TI; M.V = V; M.NQ = NQ; M.NK = NKV; M.nqkv = NQKV; M.b = b; M.P = P; M.maxpos = P + dtok; M.eps = eps; M.theta = theta;
+      M.emb = w; M.fnorm = w + (size_t)V * D; M.w = RW; M.lst = lst; M.o_in = 0; M.o_qkv = D; M.o_qn = M.o_qkv + (size_t)NQKV * D; M.o_kn = M.o_qn + HD;
+      M.o_o = M.o_kn + HD; M.o_post = M.o_o + (size_t)D * NQ; M.o_gu = M.o_post + D; M.o_d = M.o_gu + (size_t)2 * TI * D;
+      std::vector<int> pr((size_t)mmd::MAXB * P); FILE* pf = fopen((ckpt + "/prompt.i32").c_str(), "rb");
+      if (!pf || fread(pr.data(), 4, pr.size(), pf) != pr.size()) { fprintf(stderr, "cannot read %s/prompt.i32\n", ckpt.c_str()); return 2; }
+      fclose(pf); { int* dp = dalloc<int>(pr.size()); CK(cudaMemcpy(dp, pr.data(), pr.size() * 4, cudaMemcpyHostToDevice)); M.prompt = dp; }
+      M.h = dalloc<float>((size_t)b * D); M.xn = dalloc<float>((size_t)b * D); M.q = dalloc<float>((size_t)b * NQ); M.kraw = dalloc<float>((size_t)b * NKV);
+      M.att = dalloc<float>((size_t)b * NQ); M.act = dalloc<float>((size_t)b * TI);
+      M.lmax = dalloc<float>((size_t)b * (VOC / 128)); M.lidx = dalloc<int>((size_t)b * (VOC / 128)); M.lsum_part = dalloc<float>((size_t)b * (VOC / 128)); M.logitsP = dalloc<float>((size_t)b * VOC);
+      dlim = P + dtok - 1; dP = P; M.toks = dalloc<int>((size_t)dlim * mmd::MAXB); M.tok_done = dalloc<u64>(dlim);
+      M.kc = dalloc<bf16>((size_t)Lm * b * M.maxpos * NKV); M.vc = dalloc<bf16>((size_t)Lm * b * M.maxpos * NKV);
+      { std::vector<bf16> e((size_t)b * D); for (int i = 0; i < b; i++) CK(cudaMemcpy(e.data() + (size_t)i * D, w + (size_t)pr[(size_t)i * P] * D, D * 2, cudaMemcpyDeviceToHost));
+        std::vector<float> h(e.size()); for (size_t i = 0; i < e.size(); i++) h[i] = __bfloat162float(e[i]); CK(cudaMemcpy(M.h, h.data(), h.size() * 4, cudaMemcpyHostToDevice)); }
+      printf("dec real: Qwen3-4B %d layers on the trunk-ckpt weights, b=%d, prompt %d + %d tokens\n", Lm, b, P, dtok);
+    }
   }                                   // Qwen3-4B MLP width: trunk layer = frozen up [TI][D] then down [D][TI] GEMM
   C.lt = lt; const bf16* Wup = lt ? fb((size_t)lt * TI * D, 40, 1.7320508f / sqrtf((float)D)) : nullptr;
   const bf16* Wdn = lt ? fb((size_t)lt * D * TI, 41, 1.7320508f / sqrtf((float)TI)) : nullptr;
@@ -904,7 +928,15 @@ int main(int argc, char** argv) {
   Builder Bd;
   Bd.add(mk(D_DOWN, 1), {make_int2(5, -1)}); Bd.add(mk(D_QKV, NQKV / 128), {make_int2(0, 0)}); Bd.add(mk(D_ATT, b * NKVH), {make_int2(1, 0)});
   Bd.add(mk(D_O, D / 128), {make_int2(2, 0)}); Bd.add(mk(D_HEAD, nhead), {make_int2(3, 0)}); Bd.add(mk(D_NEXT, 1), {make_int2(4, 0)});
-  upload(Bd, mode == 0 ? 0 : dtok, 5, C.dc);
+  if (dreal) {   // real decode graph (mm.cu load_model order): per layer norm, qkv, attn, o, norm, gate/up, down; final norm, lm_head, argmax
+    Bd = Builder(); int pv = -1;
+    auto add = [&](int k, int n, int l, int nm) { Ph p = mk(D_REAL, n); p.koff = k; p.layer = l; p.f32 = nm; pv = Bd.add(p, {pv < 0 ? make_int2(0, -1) : make_int2(pv, 0)}); };
+    for (int l = 0; l < C.RM.L; l++) { add(mmd::K_NORM, b, l, 0); add(mmd::K_QKV, NQKV / 128, l, 0); add(mmd::K_ATT, b * NKVH, l, 0); add(mmd::K_O, D / 128, l, 0);
+      add(mmd::K_NORM, b, l, 1); add(mmd::K_GU, 2 * TI / 128, l, 0); add(mmd::K_DN, D / 128, l, 0); }
+    add(mmd::K_NORM, b, 0, 2); add(mmd::K_HEAD, VOC / 128, 0, 0); add(mmd::K_NEXT, 1, 0, 0);
+    Bd.deps[Bd.dep_off[0]] = make_int2(pv, -1);   // layer-0 norm waits for the previous token's argmax
+    upload(Bd, mode == 0 ? 0 : dlim, pv, C.dc); C.tok_done = C.RM.tok_done; dtok = dlim;
+  } else upload(Bd, mode == 0 ? 0 : dtok, 5, C.dc);
   printf("train: %d phases, %d tasks/step; decode: 6 phases, %d tasks/token\n", (int)Bt.ph.size(), C.tr.tps, C.dc.tps);
   { size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot)); printf("device memory used %.1f of %.1f GB\n", (tot - fr) / 1e9, tot / 1e9); }
 
@@ -928,12 +960,13 @@ int main(int argc, char** argv) {
     int done = 0; while (done < dtok && td[done]) done++;
     std::vector<double> lat; int inwin = 0; u64 lo = 0, hi = 0;
     for (int t = 1; t < done; t++) {
-      if ((mode == 2 && (td[t] < tr_lo || td[t] > tr_hi)) || (rate > 0 && t % Lr == 0)) continue;   // request mode: TPOT excludes queueing before a first token
+      if ((mode == 2 && (td[t] < tr_lo || td[t] > tr_hi)) || (rate > 0 && t % Lr == 0) || (dreal && t < dP)) continue;   // request mode: TPOT excludes queueing before a first token
       lat.push_back((td[t] - td[t - 1]) * 1e-6); if (!inwin) lo = td[t - 1]; hi = td[t]; inwin++;
     }
     double p50, p99; pct(lat, p50, p99); const double win = (hi - lo) * 1e-9;
     printf("decode: b=%d, %d token steps (%d in window %.3f s) -> %.1f tok/s, tpot p50 %.4f ms p99 %.4f ms\n", b, done, inwin, win, inwin * b / (win + 1e-12), p50, p99);
-    if (!dir.empty()) { dump(dir, "toks.i32", C.toks, (size_t)done * MAXB); dump(dir, "tok_done.u64", C.tok_done, (size_t)done); if (C.arr) { dump(dir, "arr.u64", const_cast<u64*>(C.arr), (size_t)nreq); dump(dir, "t0.u64", C.t0, 1); } dump(dir, "lsum.f32", C.lsum, (size_t)done * MAXB); dump(dir, "logits0.f32", C.logits0, (size_t)b * VOC); }
+    if (!dir.empty() && dreal) { dump(dir, "toks.i32", C.RM.toks, (size_t)done * mmd::MAXB); dump(dir, "tok_done.u64", C.tok_done, (size_t)done); dump(dir, "logitsP.f32", C.RM.logitsP, (size_t)b * VOC); }
+    else if (!dir.empty()) { dump(dir, "toks.i32", C.toks, (size_t)done * MAXB); dump(dir, "tok_done.u64", C.tok_done, (size_t)done); if (C.arr) { dump(dir, "arr.u64", const_cast<u64*>(C.arr), (size_t)nreq); dump(dir, "t0.u64", C.t0, 1); } dump(dir, "lsum.f32", C.lsum, (size_t)done * MAXB); dump(dir, "logits0.f32", C.logits0, (size_t)b * VOC); }
   }
   return 0;
 }
