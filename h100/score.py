@@ -11,7 +11,7 @@ import math
 import pathlib
 import re
 
-GATES = {"vs_serial_min": 3.0, "vs_mps_min": 1.5, "tpot_slo_ms": 50.0, "loss_delta_max": 0.02, "errors_max": 0}
+GATES = {"vs_serial_min": 3.0, "vs_mps_min": 1.5, "tpot_slo_ms": 50.0, "slo_attainment_min": 0.99, "loss_delta_max": 0.02, "errors_max": 0}
 
 
 def parse_mk_log(text):
@@ -28,6 +28,11 @@ def parse_mk_log(text):
         if pairs:
             last = max((k for k in pairs if k != "step0"), key=lambda k: int(k[1:]), default="step0")
             out.update(loss_initial=float(pairs.get("step0", "nan")), loss_final=float(pairs[last]), loss_final_step=last)
+    m = re.search(r"serve: demand ([\d.]+) tok/s \((open-loop|closed-loop)\), (\d+) tokens in the training window ([\d.]+) s -> ([\d.]+) tok/s, "
+                  r"latency p50 ([\d.]+) ms p99 ([\d.]+) ms, slo<=50ms ([\d.]+), lent train tasks (\d+)", text)
+    if m:
+        out.update(demand_tok_s=float(m[1]) if m[2] == "open-loop" else None, served_tok_s=float(m[5]), latency_p50_ms=float(m[6]),
+                   latency_p99_ms=float(m[7]), slo_attainment=float(m[8]), lent_tasks=int(m[9]))
     m = re.search(r"SM partition \((.*?)\)", text)
     if m:
         out["partition"] = m[1]
@@ -48,10 +53,9 @@ def mean(xs):
 def collect(out):
     out = pathlib.Path(out)
     arms = {}
-    for name in ("mk_train", "mk_split", "mk_split_dyn"):
-        log = out / f"{name}.log"
-        if log.exists():
-            arms[name] = parse_mk_log(log.read_text(errors="replace"))
+    for log in sorted(out.glob("mk_*.log")):
+        if log.stem != "mk_loss20":
+            arms[log.stem] = parse_mk_log(log.read_text(errors="replace"))
     for name in ("pt_full", "pt_graph", "te_graph", "pt_mps_pair"):
         r = load_json(out / f"{name}.json")
         if r:
@@ -82,30 +86,42 @@ def summarize(arms, gates=GATES, cosched=None):
     def score(train_tok_s, serve_tok_s):
         return train_tok_s / best_train + serve_tok_s / solo_serve
 
+    pair = None
     if "pt_mps_pair" in arms and "serve_mps_pair" in arms:
-        s["mps_useful_work"] = score(arms["pt_mps_pair"]["train_tok_s"], arms["serve_mps_pair"]["serve_tok_s"])
+        pair = (arms["pt_mps_pair"]["train_tok_s"], arms["serve_mps_pair"]["serve_tok_s"])
+        s["mps_useful_work"] = score(*pair)
     else:
         s["errors"].append("MPS pair baseline missing")
     s["cosched_useful_work"] = (cosched or {}).get("useful_work")
     rows = {}
-    for name in ("mk_split", "mk_split_dyn"):
-        a = arms.get(name)
-        if not a:
+    for name, a in arms.items():
+        if not name.startswith(("mk_split", "mk_paced", "mk_dyn")):
             continue
-        if not (a.get("train_tok_s") and a.get("serve_tok_s")):
+        demand = a.get("demand_tok_s")
+        served = a.get("served_tok_s") if demand else a.get("serve_tok_s")
+        if not (a.get("train_tok_s") and served):
             rows[name] = {"pass": False, "errors": 1, "why": "missing train or decode numbers"}
             continue
-        u = score(a["train_tok_s"], a["serve_tok_s"])
-        tpot = 1e3 / a["serve_tok_s"]
+        credit = min(served, demand) if demand else served     # open-loop arms get credit for demand met, not idle capacity
+        u = score(a["train_tok_s"], credit)
+        mps_u = score(pair[0], min(pair[1], demand) if demand else pair[1]) if pair else None
+        slo = a.get("slo_attainment")
+        tpot = 1e3 / served
+        slo_ok = (slo >= gates["slo_attainment_min"]) if slo is not None else (tpot <= gates["tpot_slo_ms"])
         dloss = abs(a["loss_final"] - ref_loss) if (ref_loss is not None and a.get("loss_final") is not None) else None
-        row = {"useful_work": u, "vs_serial": u, "train_frac": a["train_tok_s"] / best_train,
-               "serve_frac": a["serve_tok_s"] / solo_serve, "mean_tpot_ms": tpot, "loss_delta": dloss,
-               "vs_mps": u / s["mps_useful_work"] if s.get("mps_useful_work") else None,
+        row = {"useful_work": u, "vs_serial": u, "train_frac": a["train_tok_s"] / best_train, "serve_frac": credit / solo_serve,
+               "demand_tok_s": demand, "served_tok_s": served, "slo_attainment": slo, "latency_p99_ms": a.get("latency_p99_ms"),
+               "lent_tasks": a.get("lent_tasks"), "mean_tpot_ms": tpot, "loss_delta": dloss, "mps_useful_work_same_demand": mps_u,
+               "vs_mps": u / mps_u if mps_u else None,
                "vs_cosched": u / s["cosched_useful_work"] if s["cosched_useful_work"] else None, "errors": a["errors"]}
         row["pass"] = bool(row["vs_serial"] >= gates["vs_serial_min"] and row["vs_mps"] is not None
-                           and row["vs_mps"] >= gates["vs_mps_min"] and tpot <= gates["tpot_slo_ms"]
+                           and row["vs_mps"] >= gates["vs_mps_min"] and slo_ok
                            and dloss is not None and dloss <= gates["loss_delta_max"] and row["errors"] <= gates["errors_max"])
         rows[name] = row
+    for name, row in rows.items():
+        twin = "mk_paced_" + name[len("mk_dyn_"):]
+        if name.startswith("mk_dyn_") and rows.get(twin, {}).get("useful_work"):
+            row["vs_static_same_demand"] = row["useful_work"] / rows[twin]["useful_work"]
     s["fused"] = rows
     s["verdict"] = any(r.get("pass") for r in rows.values())
     return s

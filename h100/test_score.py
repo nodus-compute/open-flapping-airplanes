@@ -39,3 +39,23 @@ def test_missing_baselines(tmp_path):
     write(tmp_path, "mk_split.log", MK_SPLIT)
     s = score.summarize(score.collect(tmp_path))
     assert s["errors"] and s["verdict"] is False
+
+
+def test_dynamic_arm_credit(tmp_path):
+    base = MK_SPLIT.replace("102400", "120000")
+    paced = MK_SPLIT + ("serve: demand 200.0 tok/s (open-loop), 31000 tokens in the training window 155.00 s -> 200.0 tok/s, "
+                        "latency p50 0.900 ms p99 2.100 ms, slo<=50ms 1.0000, lent train tasks 0\n")
+    dyn = paced.replace("102400", "115000").replace("lent train tasks 0", "lent train tasks 52000")
+    write(tmp_path, "mk_train.log", base)
+    write(tmp_path, "mk_paced_200.log", paced)
+    write(tmp_path, "mk_dyn_200.log", dyn)
+    write(tmp_path, "pt_graph.json", {"tok_s": 110000.0, "loss_final": 2.145})
+    write(tmp_path, "serve_full.json", {"tok_s": [1000.0]})
+    write(tmp_path, "pt_mps_pair.json", {"tok_s": 90000.0})
+    write(tmp_path, "serve_mps_pair.json", {"tok_s": [500.0]})
+    s = score.summarize(score.collect(tmp_path))
+    dyn_row = s["fused"]["mk_dyn_200"]
+    assert abs(dyn_row["serve_frac"] - 0.2) < 1e-9 and dyn_row["lent_tasks"] == 52000
+    assert dyn_row["vs_static_same_demand"] > 1.0
+    assert abs(dyn_row["mps_useful_work_same_demand"] - (90000 / 120000 + 0.2)) < 1e-9
+    assert s["verdict"] is False

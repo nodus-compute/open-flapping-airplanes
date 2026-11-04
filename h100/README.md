@@ -19,7 +19,8 @@ Images (pinned): `pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel@sha256:3d614dfd...
 |---|---|
 | `mk_train` | megakernel, training only, all 132 SMs (solo megakernel training) |
 | `mk_split` | megakernel, ONE launch: training on 111 SMs plus decode on 21 SMs from the live weights |
-| `mk_dyn` | `mk_split` plus `DYN_ARGS` (the improved arm, see below) |
+| `mk_paced` | `mk_split` with an open-loop serving demand of R tok/s (`--serve-rate R`, R in `SERVE_RATES`, default 100 and 400), static split |
+| `mk_dyn` | IMPROVED arm: `mk_paced` plus `--lend`. A serving block whose next token is not yet due claims one training task |
 | `pt_full`, `pt_graph` | PyTorch eager / one CUDA graph per step, full GPU, solo. `pt_full` saves the checkpoint vLLM serves |
 | `serve_full`, `serve_mps` | vLLM 0.30 batch-1 decode, 256 tokens, full GPU / MPS 16% |
 | `mps_pair` | FA's baseline style, but MEASURED concurrently: PyTorch CUDA-graph training on MPS 84% plus vLLM on MPS 16%, one host MPS daemon |
@@ -27,6 +28,21 @@ Images (pinned): `pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel@sha256:3d614dfd...
 
 Megatron + Transformer Engine needs the TE source build in `llm/b200/baseline/setup_b200.sh` (use `NVTE_CUDA_ARCHS=90`). It is not in the default
 phases. If you run it, write its JSON as `OUT/te_graph.json`; `score.py` then uses it as a solo training baseline.
+
+## Improved arm: dynamic SM split driven by the serving queue (`--serve-rate R --lend`, `ofa_r2.cu`)
+Upstream decodes closed loop: the serve SMs generate tokens back to back, whatever the demand. With `--serve-rate R`, token s is released at
+`t(token 0) + s/R`, which is an open-loop demand. A serve block that holds a decode ticket whose token is not yet due has an empty queue.
+With `--lend` that block claims ONE task from the training ticket and runs it, using the same claim, dependency wait, completion counters and
+step accounting as a training block. It then returns to its held decode ticket. The 21 serve SMs therefore train whenever the serving queue
+is empty, and serve when tokens are due. A decode token waits at most one training task, which takes tens of µs. Upstream's ticket-order
+argument keeps this deadlock-free: a lending block's training ticket only depends on lower tickets. The decode ticket it holds blocks only
+later decode tokens.
+The run prints `serve: demand R tok/s (open-loop), N tokens ... latency p50/p99, slo<=50ms <fraction>, lent train tasks <n>`. Latency is
+measured from release to completion of each token, using per-token `%globaltimer` stamps. This code is compiled only into `ofa_h100_dyn` (`-DOFA_NODUS_DYN=1`).
+`ofa_h100` (mk_train, mk_split) keeps upstream's device code; only `Ctx` has 40 more bytes. Checked with nvcc 12.8 for sm_90a: 128 registers and 236/264 B
+spill stores/loads, the same as unmodified upstream (stack 1496 vs 1456 B). `ofa_h100_dyn`: 128 registers, 308/400 B spills. Lending needs the `mma.sync` backend (`OFA_GEMM_BACKEND=0`, the H100 build).
+Scoring credits open-loop arms with min(served, demand) / solo vLLM. The MPS pair gets the same demand cap: its serving term becomes
+min(vLLM-under-MPS rate, R) / solo. `vs_static_same_demand` = mk_dyn / mk_paced at the same R.
 
 ## Score and gates (pre-registered, `score.py GATES`)
 U = training tok/s / best solo full-GPU training tok/s (max of mk_train, pt_full, pt_graph, te_graph), plus serving tok/s / solo full-GPU vLLM tok/s.

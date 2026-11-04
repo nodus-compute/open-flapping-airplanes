@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # run_h100.sh : open-flapping-airplanes on ONE H100 (132 SMs), Doom compiled out, vs solo / MPS-split baselines.
-#   GPU=0 ./h100/run_h100.sh                      # full run: prep build mk_train mk_split pt_full pt_graph serve_full serve_mps mps_pair score
+#   GPU=0 ./h100/run_h100.sh                      # full run: prep build mk_train mk_split mk_paced mk_dyn pt_full pt_graph serve_full serve_mps mps_pair score
 #   PHASES="prep build mk_train mk_split" ./h100/run_h100.sh   # megakernel repro only
 # env: GPU (0) OUT (h100/results/run_<ts>) DATA (~/ofa_data, cached between runs) STEPS (4000) INFER_SMS (21 = FA's 24/148 of 132)
-#      SUDO (sudo) DYN_ARGS (extra args for the mk_split_dyn arm, phase mk_dyn)
+#      SUDO (sudo) SERVE_RATES ("100 400": open-loop demand in tok/s for mk_paced and mk_dyn)
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd); GPU=${GPU:-0}; STEPS=${STEPS:-4000}; SUDO=${SUDO-sudo}
 OUT=$(realpath -m "${OUT:-$ROOT/h100/results/run_$(date +%Y%m%d_%H%M%S)}"); DATA=$(realpath -m "${DATA:-$HOME/ofa_data}")
 MPSDIR=/tmp/ofa_mps_$GPU; mkdir -p "$OUT" "$DATA" "$MPSDIR/pipe" "$MPSDIR/log"
-PHASES=${PHASES:-"prep build mk_train mk_split pt_full pt_graph serve_full serve_mps mps_pair score"}
+PHASES=${PHASES:-"prep build mk_train mk_split mk_paced mk_dyn pt_full pt_graph serve_full serve_mps mps_pair score"}
 TOTAL=$(nvidia-smi -i "$GPU" --query-gpu=name --format=csv,noheader | grep -q H100 && echo 132 || echo 0)
 [ "$TOTAL" = 132 ] || { echo "GPU $GPU is not an H100"; exit 2; }
 INFER=${INFER_SMS:-21}; TRAIN=$((TOTAL - INFER)); TRAIN_PCT=$(( (100 * TRAIN + TOTAL / 2) / TOTAL )); INFER_PCT=$(( (100 * INFER + TOTAL / 2) / TOTAL ))
@@ -34,12 +34,17 @@ SERVE="--vocab /root/data/cl100k_vocab.bin --prompt /root/data/prompt_ids.txt --
 BL=llm/b200/baseline; CK=/root/data/ckpt_pytorch_step$STEPS.pt; HF=/root/data/hf_trained_$STEPS
 
 has prep && dk $PT_IMG prep.log -- "pip install -q tiktoken numpy && python h100/prep.py"
-has build && dk $PT_IMG build.log -- "cd llm/b200/megakernel && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100 && cat /out/ofa_h100.buildlog | grep -E 'ofa_kernel|registers|spill' | head -4"
+# ofa_h100 = upstream kernel (Nodus code compiled out); ofa_h100_dyn = -DOFA_NODUS_DYN=1 (open-loop demand + lending), used by mk_paced and mk_dyn
+has build && dk $PT_IMG build.log -- "cd llm/b200/megakernel && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100 && NODOOM=1 ./build_r2.sh sm_90a /out/ofa_h100_dyn -DOFA_NODUS_DYN=1"
 MK=/out/ofa_h100
 has mk_loss20 && dk $PT_IMG mk_loss20.log -- "$MK --steps 20 $BASE --no-doom --loss-out /out/mk_loss20.txt"
 has mk_train && dk $PT_IMG mk_train.log -- "timeout -k 10 1800 $MK $BASE --no-doom --steps $STEPS --loss-out /out/mk_train_loss.txt"
 has mk_split && dk $PT_IMG mk_split.log -- "timeout -k 10 1800 $MK --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --loss-out /out/mk_split_loss.txt --text-out /out/mk_split_tokens.txt"
-has mk_dyn && dk $PT_IMG mk_split_dyn.log -- "timeout -k 10 1800 $MK --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --loss-out /out/mk_split_dyn_loss.txt ${DYN_ARGS:-}"
+# open-loop serving demand R tok/s (batch-1 stream): static split (mk_paced) vs dynamic split where idle serve blocks lend to training (mk_dyn)
+for R in ${SERVE_RATES:-100 400}; do
+  has mk_paced && dk $PT_IMG mk_paced_$R.log -- "timeout -k 10 1800 ${MK}_dyn --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --serve-rate $R --loss-out /out/mk_paced_${R}_loss.txt"
+  has mk_dyn && dk $PT_IMG mk_dyn_$R.log -- "timeout -k 10 1800 ${MK}_dyn --infer-sms $INFER --doom-sms 0 --train-sms $TRAIN --no-doom $SERVE $BASE --steps $STEPS --serve-rate $R --lend --loss-out /out/mk_dyn_${R}_loss.txt"
+done
 has pt_full && dk $PT_IMG pt_full.log -- "pip install -q tiktoken numpy && cd $BL && python train_pytorch.py --steps $STEPS --out /out/pt_full.json --tag full --save $CK"
 has pt_graph && dk $PT_IMG pt_graph.log -- "pip install -q tiktoken numpy && cd $BL && python train_pytorch.py --cuda_graph --steps $STEPS --out /out/pt_graph.json --tag full"
 if has serve_full || has serve_mps || has mps_pair; then
