@@ -247,7 +247,7 @@ __device__ __noinline__ bool lend_train_task(const Ctx& C, char* smem, int* lc) 
     int res = 0, step = 0, ph = 0, local = 0;
     if (stopped(C) || !C.train_sms || ld_vol(J.ticket) >= total) res = -2;
     else {
-      const unsigned g = atomicAdd(const_cast<unsigned*>(J.ticket), 1u);
+      const unsigned g = ld_vol(J.ticket);
       if (g >= total) res = -2;
       else {
         step = (int)(g / (unsigned)J.tps); const int r = (int)(g - (unsigned)step * (unsigned)J.tps);
@@ -257,18 +257,15 @@ __device__ __noinline__ bool lend_train_task(const Ctx& C, char* smem, int* lc) 
         lc[0] = cph; ph = cph; local = r - __ldg(J.prefix + ph);
         if (!(step == lc[1] && ph == lc[2])) {
           const int off = __ldg(J.dep_off + ph), cnt = __ldg(J.dep_cnt + ph);
-          for (;;) {
-            if (stopped(C)) { res = -2; break; }
-            bool ready = true;
-            for (int k = 0; k < cnt && ready; k++) {
-              const int2 e = __ldg(J.deps + off + k);
-              const int need = __ldg(J.ntasks + e.x) * (step + 1 + e.y);
-              if (need > 0 && ld_acq(J.done + e.x) < need) ready = false;
-            }
-            if (ready) { lc[1] = step; lc[2] = ph; break; }
-            __nanosleep(100);
+          bool ready = true;
+          for (int k = 0; k < cnt && ready; k++) {
+            const int2 e = __ldg(J.deps + off + k);
+            const int need = __ldg(J.ntasks + e.x) * (step + 1 + e.y);
+            if (need > 0 && ld_acq(J.done + e.x) < need) ready = false;
           }
+          if (ready) { lc[1] = step; lc[2] = ph; } else res = -2;
         }
+        if (!res && atomicCAS(const_cast<unsigned*>(J.ticket), g, g + 1) != g) res = -2;
       }
     }
     s_l[0] = res; s_l[1] = step; s_l[2] = ph; s_l[3] = local;
