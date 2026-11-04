@@ -29,6 +29,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("--partial", action="store_true")
+    ap.add_argument("--min-u", type=float, default=0.0, help="gate: some co arm with U >= this (and f_decode >= --min-f-decode)")
+    ap.add_argument("--min-f-decode", type=float, default=0.0)
     a = ap.parse_args()
     d = Path(a.out) / "cdc"
     tr = u64(d / "train" / "step_done.u64")
@@ -49,9 +51,12 @@ def main():
         rows.append(dict(arm=p.name, b=b, overlap_s=(hi - lo) * 1e-9 if lo is not None and hi > lo else None, decode_solo_tok_s=ds, decode_co_tok_s=dc,
                          train_alone_steps_s=t_alone, train_co_steps_s=tc, f_decode=fd, f_train=ft,
                          U=fd + ft if fd is not None and ft is not None else None))
-    res = dict(bundle=str(a.out), arms=rows, missing=missing, complete=bool(rows) and not missing)
+    ok = [r for r in rows if r["U"] is not None and r["U"] >= a.min_u and r["f_decode"] >= a.min_f_decode]
+    best = max((r for r in rows if r["U"] is not None), key=lambda r: r["U"], default=None)
+    res = dict(bundle=str(a.out), arms=rows, missing=missing, complete=bool(rows) and not missing, best_arm=best and best["arm"],
+               gate=dict(min_u=a.min_u, min_f_decode=a.min_f_decode, passing_arms=[r["arm"] for r in ok]))
     print(json.dumps(res, indent=1))
-    sys.exit(0 if a.partial or res["complete"] else 1)
+    sys.exit(0 if a.partial or (res["complete"] and ok) else 1)
 
 
 if __name__ == "__main__":
