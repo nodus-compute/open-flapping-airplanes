@@ -40,7 +40,7 @@ busy=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader)
 if has preflight; then
   PFD=${PREFLIGHT_DEADLINE_S:-60}; PFL=$((PFD - SECONDS)); PFJ=0
   if has trunk_tail || has codec || has trunk_bwd; then for v in ${TAIL_JOBS:-8 16 32} ${CODEC_JOBS:-16} ${TRUNK_BWD_JOBS:-8}; do [ "$v" -gt "$PFJ" ] && PFJ=$v; done; fi
-  [ "$PFL" -gt 0 ] && timeout -k 5 "$PFL" python3 "$ROOT/h100/preflight.py" --out "$OUT" --gpu "$GPU" --img "$PT_IMG" --sudo "$SUDO" --deadline-s "$PFL" --mps-pipe "$PMPS" $([ "${OFFLINE:-0}" = 1 ] && echo "--offline --py-deps $PY_DEPS") \
+  [ "$PFL" -gt 0 ] && timeout -k 5 "$PFL" python3 "$ROOT/h100/preflight.py" --out "$OUT" --gpu "$GPU" --img "$PT_IMG" --sudo "$SUDO" --deadline-s "$PFL" --mps-pipe "$PMPS" --gpu-name "${GPU_NAME:-H100 80GB HBM3}" $([ "${OFFLINE:-0}" = 1 ] && echo "--offline --py-deps $PY_DEPS") \
     --jobs "${PREFIX_JOBS:-$PFJ}" ${PREFIX_RUN:+--prefix-run "$PREFIX_RUN"} --train-data "${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}" \
     --hf-cache "${HF_CACHE:-$HOME/.cache/huggingface}" --revision 1cfa9a7208912126459214e8b04321603b3df60c --data "$DATA" \
     || { echo "preflight failed (see $OUT/preflight.json)"; exit 7; }
