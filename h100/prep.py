@@ -18,13 +18,22 @@ def sh(cmd, cwd=None):
     subprocess.run(cmd, shell=True, cwd=cwd, check=True, executable="/bin/bash")
 
 
+def fetch(url, out, last_byte=None):
+    import shutil
+    import urllib.request
+    req = urllib.request.Request(url, headers={"Range": f"bytes=0-{last_byte}"} if last_byte is not None else {})
+    print("+ fetch", url, flush=True)
+    with urllib.request.urlopen(req) as r, open(out, "wb") as f:
+        shutil.copyfileobj(r, f, 1 << 20)
+
+
 def main():
     os.makedirs(DATA, exist_ok=True)
     valid, train = f"{DATA}/TinyStories-valid.txt", f"{DATA}/TinyStories-train-prefix.txt"
     if not os.path.exists(valid) or os.path.getsize(valid) < 1e7:
-        sh(f"curl -sfL -o {valid} {HF}/TinyStories-valid.txt")
+        fetch(f"{HF}/TinyStories-valid.txt", valid)
     if not os.path.exists(train) or os.path.getsize(train) < 3e8:
-        sh(f"curl -sfL -r 0-314572799 -o {train} {HF}/TinyStories-train.txt")
+        fetch(f"{HF}/TinyStories-train.txt", train, last_byte=314572799)
     if not os.path.exists(f"{DATA}/tinystories_cl100k_train.u32"):
         sh(f"{sys.executable} prep_data.py", cwd=BL)
     ntok = os.path.getsize(f"{DATA}/tinystories_cl100k_train.u32") // 4
