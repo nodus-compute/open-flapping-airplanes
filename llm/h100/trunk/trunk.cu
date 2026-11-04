@@ -195,7 +195,7 @@ __device__ __noinline__ void radv_tc(const Ctx& C, const Ph& d, int local, int t
       (void)lane; return;
 }
 
-__device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char* smem) {
+__device__ __noinline__ void train_task(const Ctx& C, const Ph& d, int local, int step, char* smem) {
   float* red = reinterpret_cast<float*>(smem);
   const int tid = threadIdx.x, tk = C.tk, rb_per_job = tk / ROWS;
   const bf16* X = C.lt ? C.Xt[C.lt % 2] : C.X + (size_t)(step % C.nx) * tk * D;
@@ -497,7 +497,7 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
 }
 
 // ------------------------------------------------------------------------------------------------ decode tasks (one token step)
-__device__ void decode_task(const Ctx& C, const Ph& d, int local, int step, char* smem) {
+__device__ __noinline__ void decode_task(const Ctx& C, const Ph& d, int local, int step, char* smem) {
   if (d.kind == D_REAL) { mmd::Ph p; p.kind = d.koff; p.ntasks = d.ntasks; p.layer = d.layer; p.norm = d.f32; mmd::decode_task(C.RM, p, local, step, smem); return; }
   float* sm = reinterpret_cast<float*>(smem);
   const int tid = threadIdx.x, b = C.b, pos = C.ctx0 + (C.L ? step % C.L : step);
@@ -696,7 +696,7 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
   }
 }
 
-__global__ void __launch_bounds__(THREADS, 2) mw_kernel(const Ctx C) {
+__global__ void __launch_bounds__(THREADS, 2) mw_kernel(const __grid_constant__ Ctx C) {
   extern __shared__ __align__(128) unsigned char dsm[];
   unsigned hw; asm volatile("mov.u32 %0, %%smid;" : "=r"(hw));
   const int smid = C.smid_rank ? C.smid_rank[hw] : (int)hw;
