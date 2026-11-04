@@ -13,6 +13,7 @@ GPU=0 ALLOW_GPU0=1 PHASES="prep build mk_loss20 mk_train mk_split score" ./h100/
 ```
 Images (pinned): `pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel@sha256:3d614dfd...` builds and runs the megakernel and the PyTorch baselines.
 `vllm/vllm-openai:v0.30.0-x86_64@sha256:5f5e5352...` runs the vLLM baseline. Data (about 1.5 GB) is cached in `$DATA` (default `~/ofa_data`).
+Prep now downloads with Python urllib inside the container, and the run fails closed on missing inputs.
 
 ## Arms (model S: 162.4M GPT, 4,000 steps x 4,096 tokens; split 111 train / 21 serve SMs, FA's 24/148 proportion)
 | phase | what |
