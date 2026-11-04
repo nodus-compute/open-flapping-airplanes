@@ -4,6 +4,7 @@
 #   PHASES="prep build mk_train mk_split" ./h100/run_h100.sh   # megakernel repro only
 #   OUT=h100/results/mw PHASES="build_mw mw score_mw" ./h100/run_h100.sh   # multi-workload arm (env MW_INFER_SMS 33, MW_STEPS, MW_DEC_TOKENS, MW_BATCHES "1 8")
 #   OUT=h100/results/ml PHASES="build_ml ml ml_vllm score_ml" ./h100/run_h100.sh   # multi-adapter LoRA decode (SGMV instruction) vs loop / PyTorch / vLLM
+#   OUT=h100/results/sched PHASES="build_sched sched score_sched" ./h100/run_h100.sh   # SLO-aware priority instruction scheduler (env SCHED_RATES "2 4 8 16")
 # env: GPU (0) OUT (h100/results/run_<ts>) DATA (~/ofa_data, cached between runs) STEPS (4000) INFER_SMS (21 = FA's 24/148 of 132)
 #      ALLOW_GPU0 (0: GPU 0 is refused unless 1)  SUDO (sudo) SERVE_RATES ("100 400": open-loop demand in tok/s for mk_paced and mk_dyn)
 set -uo pipefail
@@ -138,5 +139,31 @@ if has ml; then
 fi
 has ml_vllm && dk $VLLM_IMG ml_vllm.log -v "$HFC":/root/.cache/huggingface -e HF_TOKEN -- "python3 h100/vllm_mlora.py --batches $MLB --adapters $MLA --out /out/ml_vllm.json"
 has score_ml && python3 "$ROOT/h100/mlora_score.py" "$OUT"
+SC=/out/sched_h100; SCR=${SCHED_RATES:-2 4 8 16}; SCN=${SCHED_NREQ:-64}; SCL=${SCHED_REQ_TOKENS:-64}; SCB=${SCHED_B:-8}; SCS=${SCHED_STEPS:-200000}
+SC_DEC_PCT=${SCHED_MPS_DEC_PCT:-25}
+# 100 ms GPU counters per arm: DCGM 1002 SM_ACTIVE, 1003 SM_OCCUPANCY, 1004 PIPE_TENSOR_ACTIVE, 1005 DRAM_ACTIVE (nvidia-smi fallback)
+dcgm_on() { if command -v dcgmi >/dev/null 2>&1; then dcgmi dmon -i "$GPU" -e 1002,1003,1004,1005 -d 100 > "$OUT/dcgm_$1.txt" 2>&1 &
+  else nvidia-smi -i "$GPU" --query-gpu=timestamp,utilization.gpu,utilization.memory,clocks.sm --format=csv -lms 100 > "$OUT/dcgm_$1.txt" 2>&1 & fi; DCGM_PID=$!; }
+dcgm_off() { kill "$DCGM_PID" 2>/dev/null; wait "$DCGM_PID" 2>/dev/null || true; }
+has build_sched && dk $PT_IMG build_sched.log -- "cd llm/h100/sched && nvcc -arch=sm_90a -O3 -std=c++17 --extended-lambda -maxrregcount=128 -Xptxas -v -o $SC sched.cu"
+if has sched; then
+  scd() { local n=$1; shift; mkdir -p "$OUT/sched/$n"; dk $PT_IMG sched_$n.log "$@"; }
+  scd train_ref -- "timeout -k 10 600 $SC --mode train --steps 64 --dump /out/sched/train_ref"
+  dcgm_on train_solo; scd train_solo -- "timeout -k 10 600 $SC --mode train --steps $SCS --max-seconds 20 --dump /out/sched/train_solo"; dcgm_off
+  for R in $SCR; do
+    A="--b $SCB --rate $R --nreq $SCN --req-tokens $SCL"
+    dcgm_on solo_r$R; scd solo_r$R -- "timeout -k 10 900 $SC --mode dec $A --dump /out/sched/solo_r$R"; dcgm_off
+    for P in fifo prio; do
+      dcgm_on ${P}_r$R; scd ${P}_r$R -- "timeout -k 10 900 $SC --mode mix --sched $P --steps $SCS $A --dump /out/sched/${P}_r$R"; dcgm_off
+    done
+    DUR=$(python3 -c "print(int($SCN / $R + 10))")
+    mps_start; dcgm_on mps_r$R
+    scd mps_train_r$R "${MPS_ENV[@]}" -e CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$((100 - SC_DEC_PCT)) -- "timeout -k 10 900 $SC --mode train --steps $SCS --max-seconds $DUR --dump /out/sched/mps_train_r$R" & tp=$!
+    sleep 3
+    scd mps_dec_r$R "${MPS_ENV[@]}" -e CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$SC_DEC_PCT -- "timeout -k 10 900 $SC --mode dec $A --dump /out/sched/mps_dec_r$R"
+    wait $tp; dcgm_off; mps_stop
+  done
+fi
+has score_sched && python3 "$ROOT/h100/sched_score.py" "$OUT"
 has score && python3 "$ROOT/h100/score.py" "$OUT" ${COSCHED_SUMMARY:+--cosched-summary "$COSCHED_SUMMARY"}
 echo "artifacts: $OUT"
