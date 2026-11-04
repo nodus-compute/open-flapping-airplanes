@@ -20,7 +20,10 @@ log "worktree $ROOT at $SHA"
 for j in $(seq 0 $((JOBS - 1))); do [ -d "$PRUN/dedicated-$j" ] || { log "FAIL $PRUN/dedicated-$j missing"; exit 2; }; done
 log "prefix_run $PRUN (dedicated-0..$((JOBS - 1)))"
 PT_IMG=$(sed -n 's/^PT_IMG=\(\S*\)$/\1/p' "$ROOT/h100/run_h100.sh"); [ -n "$PT_IMG" ] || { log "FAIL PT_IMG not found in run_h100.sh"; exit 2; }
-if $SUDO docker image inspect "$PT_IMG" >/dev/null 2>&1; then log "image present $PT_IMG"; else log "pulling $PT_IMG"; $SUDO docker pull "$PT_IMG" >/dev/null; fi
+OFF=${OFFLINE:-0}   # OFFLINE=1: everything was staged by the GPU-free h100/stage_offline.sh entry; verify only, never pull or download
+if $SUDO docker image inspect "$PT_IMG" >/dev/null 2>&1; then log "image present $PT_IMG"
+elif [ "$OFF" = 1 ]; then log "FAIL OFFLINE=1 and $PT_IMG not present (run h100/stage_offline.sh)"; exit 2
+else log "pulling $PT_IMG"; $SUDO docker pull "$PT_IMG" >/dev/null; fi
 SNAP="$HFC/hub/models--${REPO/\//--}/snapshots/$REV"
 complete() { [ -f "$SNAP/config.json" ] && [ -f "$SNAP/model.safetensors.index.json" ] && [ -f "$SNAP/tokenizer.json" ] && python3 - "$SNAP" <<'PY'
 import json, os, sys
@@ -28,7 +31,9 @@ s = sys.argv[1]; w = set(json.load(open(os.path.join(s, "model.safetensors.index
 sys.exit(0 if all(os.path.isfile(os.path.join(s, f)) for f in w) else 1)
 PY
 }
-if complete; then log "hf cache complete $SNAP"; else
+if complete; then log "hf cache complete $SNAP"
+elif [ "$OFF" = 1 ]; then log "FAIL OFFLINE=1 and $SNAP incomplete (run h100/stage_offline.sh)"; exit 2
+else
   log "downloading $REPO@$REV into $HFC"; mkdir -p "$HFC"
   TOK=(); [ -n "${HF_TOKEN:-}" ] && TOK=(-e HF_TOKEN)
   $SUDO docker run --rm --entrypoint bash -v "$HFC":/root/.cache/huggingface "${TOK[@]}" "$PT_IMG" -c \

@@ -46,6 +46,8 @@ def main():
     ap.add_argument("--revision", default="")
     ap.add_argument("--data", default="")
     ap.add_argument("--mps-pipe", default="", help="private empty CUDA_MPS_PIPE_DIRECTORY our processes run with")
+    ap.add_argument("--offline", action="store_true", help="GPU run without network: HF snapshot must be complete in the cache, --py-deps staged")
+    ap.add_argument("--py-deps", default="", help="pip --target dir from h100/stage_offline.sh (offline prep deps)")
     ap.add_argument("--min-disk-gib", type=float, default=30.0)
     a = ap.parse_args()
     left = lambda: a.deadline_s - (time.monotonic() - T0)  # noqa: E731
@@ -84,6 +86,8 @@ def main():
               "print('MATMUL_OK',torch.cuda.get_device_name(0),y==y);"
               "print(subprocess.run(['nvcc','--version'],capture_output=True,text=True).stdout.splitlines()[-1])")
         mps = ["-e", "CUDA_MPS_PIPE_DIRECTORY=/mps_private", "-v", f"{pipe}:/mps_private:ro"] if pipe else []
+        if a.offline:
+            mps += ["--network", "none"]
         rc, o = sh(sudo + ["docker", "run", "--rm", "--gpus", f'"device={a.gpu}"', *mps, "--entrypoint", "python", a.img, "-c", py],
                    left() - 2)
         check("container_cuda_matmul_nvcc", rc == 0 and "MATMUL_OK" in o and "True" in o and "cuda" in o.lower(), o)
@@ -103,7 +107,16 @@ def main():
 
     if a.revision:
         snap = Path(a.hf_cache) / "hub" / f"models--{a.repo.replace('/', '--')}" / "snapshots" / a.revision / "config.json"
-        if snap.is_file():
+        if a.offline:
+            d = snap.parent
+            try:
+                w = set(json.loads((d / "model.safetensors.index.json").read_text())["weight_map"].values())
+            except (OSError, ValueError, KeyError):
+                w = None
+            check("hf_revision_offline_complete", bool(w) and snap.is_file() and (d / "tokenizer.json").is_file() and all((d / f).is_file() for f in w), d)
+            deps = Path(a.py_deps)
+            check("py_deps_offline", all((deps / m / "__init__.py").is_file() for m in ("transformers", "safetensors", "huggingface_hub", "numpy")), deps)
+        elif snap.is_file():
             check("hf_revision", True, snap)
         else:
             url = f"https://huggingface.co/{a.repo}/resolve/{a.revision}/config.json"
@@ -120,7 +133,7 @@ def main():
     el = time.monotonic() - T0
     check("within_deadline", el <= a.deadline_s, f"{el:.1f}s <= {a.deadline_s}s")
     passed = all(c["ok"] for c in checks.values())
-    s = {"passed": passed, "elapsed_s": round(el, 2), "deadline_s": a.deadline_s, "gpu": a.gpu, "gpu_uuid": uuid, "mps_pipe_dir": pipe, "host_mps_control_daemons": host_mps, "image": a.img,
+    s = {"passed": passed, "elapsed_s": round(el, 2), "deadline_s": a.deadline_s, "gpu": a.gpu, "gpu_uuid": uuid, "mps_pipe_dir": pipe, "offline": a.offline, "host_mps_control_daemons": host_mps, "image": a.img,
          "failed": [k for k, c in checks.items() if not c["ok"]], "checks": checks}
     Path(a.out, "preflight.json").write_text(json.dumps(s, indent=1))
     print(f"preflight passed={passed} elapsed={el:.1f}s failed={s['failed']}")

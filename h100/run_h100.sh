@@ -27,6 +27,9 @@ require_inputs() {
     [ -s "$path" ] || { echo "missing $path: run PHASES=prep (h100/prep.py generates init_flat_S.f32 like upstream b200-run/modal_app.py prep())" >&2; exit 6; }
   done
 }
+# OFFLINE=1: no network at GPU run time. Prep deps come from PY_DEPS (pip --target by the GPU-free h100/stage_offline.sh entry), HF reads cache only
+NET=(); if [ "${OFFLINE:-0}" = 1 ]; then [ -d "${PY_DEPS:-/nonexistent}/transformers" ] || { echo "OFFLINE=1 needs PY_DEPS from h100/stage_offline.sh"; exit 2; }
+  NET=(--network none -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e PYTHONPATH=/deps -v "$PY_DEPS":/deps:ro); fi
 [ "$GPU" != 0 ] || [ "${ALLOW_GPU0:-0}" = 1 ] || { echo "refusing GPU 0 without ALLOW_GPU0=1"; exit 4; }
 busy=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader)
 [ -z "$busy" ] || { echo "refusing: GPU $GPU busy (pids $busy)"; exit 3; }
@@ -37,7 +40,7 @@ busy=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader)
 if has preflight; then
   PFD=${PREFLIGHT_DEADLINE_S:-60}; PFL=$((PFD - SECONDS)); PFJ=0
   if has trunk_tail || has codec || has trunk_bwd; then for v in ${TAIL_JOBS:-8 16 32} ${CODEC_JOBS:-16} ${TRUNK_BWD_JOBS:-8}; do [ "$v" -gt "$PFJ" ] && PFJ=$v; done; fi
-  [ "$PFL" -gt 0 ] && timeout -k 5 "$PFL" python3 "$ROOT/h100/preflight.py" --out "$OUT" --gpu "$GPU" --img "$PT_IMG" --sudo "$SUDO" --deadline-s "$PFL" --mps-pipe "$PMPS" \
+  [ "$PFL" -gt 0 ] && timeout -k 5 "$PFL" python3 "$ROOT/h100/preflight.py" --out "$OUT" --gpu "$GPU" --img "$PT_IMG" --sudo "$SUDO" --deadline-s "$PFL" --mps-pipe "$PMPS" $([ "${OFFLINE:-0}" = 1 ] && echo "--offline --py-deps $PY_DEPS") \
     --jobs "${PREFIX_JOBS:-$PFJ}" ${PREFIX_RUN:+--prefix-run "$PREFIX_RUN"} --train-data "${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}" \
     --hf-cache "${HF_CACHE:-$HOME/.cache/huggingface}" --revision 1cfa9a7208912126459214e8b04321603b3df60c --data "$DATA" \
     || { echo "preflight failed (see $OUT/preflight.json)"; exit 7; }
@@ -46,7 +49,7 @@ fi
 dk() { local img=$1 log=$2 t0; t0=$(date +%s.%N); shift 2; local extra=(); while [ "$1" != -- ]; do extra+=("$1"); shift; done; shift
   $SUDO docker run --rm --gpus "\"device=$GPU\"" --ipc=host --entrypoint bash -e HOME=/root -e DATA_DIR=/root/data -e MODEL=S \
     -e TOTAL_SMS=$TOTAL -e TRAIN_SMS=$TRAIN -e INFER_SMS=$INFER -e PYTHONUNBUFFERED=1 -e CUDA_MPS_PIPE_DIRECTORY=/mps_private -v "$PMPS":/mps_private:ro -v "$ROOT":/src -v "$DATA":/root/data -v "$OUT":/out \
-    "${extra[@]}" -w /src "$img" -c "$*" > "$OUT/$log" 2>&1; local rc=$?
+    "${NET[@]}" "${extra[@]}" -w /src "$img" -c "$*" > "$OUT/$log" 2>&1; local rc=$?
   printf 'start %s\nend %s\nrc %s\n' "$t0" "$(date +%s.%N)" "$rc" > "$OUT/${log%.log}.wall"; echo "$log rc=$rc: $(tail -1 "$OUT/$log" | cut -c1-160)"; return $rc; }
 MPS_ENV=(-e CUDA_MPS_PIPE_DIRECTORY=/mps/pipe -v "$MPSDIR":/mps)
 mps_start() { $SUDO env CUDA_VISIBLE_DEVICES=$GPU CUDA_MPS_PIPE_DIRECTORY=$MPSDIR/pipe CUDA_MPS_LOG_DIRECTORY=$MPSDIR/log nvidia-cuda-mps-control -d; sleep 2; }
@@ -187,6 +190,7 @@ MM_REV0=c1899de289a04d12100db370d81485cdf75e47ca; MM_REV1=1cfa9a7208912126459214
 MMD0=/root/data/mm/qwen3_0p6b; MMD1=/root/data/mm/qwen3_4b
 has build_mm && dk $PT_IMG build_mm.log -- "cd llm/h100/mm && nvcc -arch=sm_90a -O3 -std=c++17 --extended-lambda -maxrregcount=128 -Xptxas -v -o $MMX mm.cu"
 MM_PIP="pip install -q numpy safetensors huggingface_hub transformers==4.56.2"
+[ "${OFFLINE:-0}" = 1 ] && MM_PIP="python -c 'import numpy, safetensors, huggingface_hub, transformers'"
 if has mm; then
   dk $PT_IMG mm_prep.log -v "$HFC":/root/.cache/huggingface -e HF_TOKEN -- "$MM_PIP && python h100/mm_prep.py --repo Qwen/Qwen3-0.6B --revision $MM_REV0 --out $MMD0 && python h100/mm_prep.py --repo Qwen/Qwen3-4B --revision $MM_REV1 --out $MMD1"
   MMA="--model0 $MMD0 --model1 $MMD1 --tokens0 $MMT0 --tokens1 $MMT1"
