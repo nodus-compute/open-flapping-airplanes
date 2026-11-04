@@ -887,7 +887,7 @@ int main(int argc, char** argv) {
   }
   C.G = dalloc<float>((size_t)jobs * PJ); C.M = dalloc<float>((size_t)jobs * PJ); C.Vm = dalloc<float>((size_t)jobs * PJ);
   C.U = dalloc<float>((size_t)jobs * tk * R2); C.dU = dalloc<float>((size_t)jobs * tk * R2); C.dO = dalloc<float>((size_t)jobs * tk * NQV);
-  C.lpart = dalloc<float>((size_t)jobs * (tk / ROWS)); C.cer = cer; C.lrow = cer != ROWS ? dalloc<float>((size_t)jobs * tk) : nullptr; C.loss = dalloc<float>((size_t)steps * jobs); C.step_done = dalloc<u64>(steps);
+  C.lpart = dalloc<float>((size_t)jobs * (tk / ROWS)); C.cer = cer; C.lrow = treal && cer != ROWS ? dalloc<float>((size_t)jobs * tk) : nullptr; C.loss = dalloc<float>((size_t)steps * jobs); C.step_done = dalloc<u64>(steps);
   // decode state: one adapter (A and B random), KV cache prefilled for ctx0 positions, inputs = embeddings of tokens 1..b
   C.adp = ff(PJ, 7, 1.7320508f / sqrtf((float)D));
   { float* a = const_cast<float*>(C.adp); fill_f32<<<256, 256>>>(a + 2 * R * D, (size_t)NQV * R, seed * 131 + 8, 0.02f); }
