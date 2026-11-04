@@ -1,0 +1,49 @@
+{
+ "id": "ofa-ckpt-chain-staged-8ecde86e7f32",
+ "repo": "nodus-compute/open-flapping-airplanes",
+ "repo_sha": "8ecde86e7f326bcfb44943549ecbd1821db81e36",
+ "branch": "devin/1793766400-h100-repro",
+ "gpus": 1,
+ "priority": 78,
+ "cwd": "/home/ubuntu/ofa-8ecde86e7f32",
+ "out": "/home/ubuntu/gpu-queue-runs/ofa-ckpt-chain-staged-8ecde86e7f32",
+ "once": true,
+ "requires_free_gpus": 1,
+ "forbidden_gpu_indices": [
+  0
+ ],
+ "min_free_mib": 70000,
+ "require_gpu_name": "H100 80GB HBM3",
+ "min_driver_major": 580,
+ "sudo": false,
+ "argv": [
+  "bash",
+  "-c",
+  "cd /home/ubuntu/ofa-8ecde86e7f32 && O=$HOME/ofa-runs/ckpt-chain-8ecde86e7f32-$(date -u +%Y%m%dT%H%M%SZ) && GEMM=mma GPU={gpu} OUT=$O TRUNK_CKPT_SUMMARY=$O/trunk_ckpt_summary.json TRAIN_BUBBLE_DATA=$HOME/training-bubble-data PREFLIGHT_DEADLINE_S=60 TRUNK_CKPT_JOBS=\"8 16 32\" TRUNK_CKPT_STEPS=50 TAIL_JOBS=\"8 16 32\" TAIL_STEPS=50 CODEC_JOBS=16 CODEC_STEPS=24 CODEC_DEC_TOKENS=2048 CODEC_BATCHES=\"1 8\" CODEC_RESERVE=\"0 16\" CODEC_ATTN_BWD=cuda PHASES=\"preflight build_trunk trunk_ckpt score_trunk_ckpt trunk_tail score_trunk_tail codec score_codec\" bash h100/stage_chain.sh --sha 8ecde86e7f326bcfb44943549ecbd1821db81e36 --jobs 32 --prefix-run PREFIX_RUN_PATH"
+ ],
+ "prefix_run_arg": "replace PREFIX_RUN_PATH in argv with the audited wall4x training_prefix N32 seed-413 top-layers-1 run dir (config.json, summary.json, dedicated-0..31)",
+ "staging": [
+  "worktree: runner stages cwd from repo_sha (git archive + .sha); stage_chain.sh verifies .sha or git HEAD == repo_sha",
+  "PREFIX_RUN: path argument, checked first (fails in <1 s)",
+  "docker pull pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel@sha256:3d614dfd422b7e43647491cbf07d6acc516c032fc49c594a94afdebd52552fb9 if not local",
+  "Qwen/Qwen3-4B@1cfa9a7208912126459214e8b04321603b3df60c into host ~/.cache/huggingface, HF_TOKEN from host env if set; skipped when snapshot complete"
+ ],
+ "gates": {
+  "preflight_within_first_seconds": 60,
+  "preflight_before_any_arm": true,
+  "hf_cut_hidden": true,
+  "trunk_tail_first16_loss_rel_vs_training_prefix": 0.001,
+  "codec_decode_tokens_bitwise_vs_solo": true,
+  "codec_losses_bitwise_vs_solo16": true,
+  "codec_p99_tpot_le_x_solo": 1.1,
+  "one_launch": true,
+  "dcgm_interval_ms": 100,
+  "zero_errors": true
+ },
+ "reports": [
+  "preflight.json",
+  "trunk_ckpt_summary.json",
+  "trunk_tail_summary.json",
+  "codec_summary.json"
+ ]
+}
