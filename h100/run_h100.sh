@@ -2,6 +2,7 @@
 # run_h100.sh : open-flapping-airplanes on ONE H100 (132 SMs), Doom compiled out, vs solo / MPS-split baselines.
 #   GPU=0 ./h100/run_h100.sh                      # full run: prep build mk_train mk_split mk_paced mk_dyn pt_full pt_graph serve_full serve_mps mps_pair score
 #   PHASES="prep build mk_train mk_split" ./h100/run_h100.sh   # megakernel repro only
+#   OUT=h100/results/mw PHASES="build_mw mw score_mw" ./h100/run_h100.sh   # multi-workload arm (env MW_INFER_SMS 33, MW_STEPS, MW_DEC_TOKENS, MW_BATCHES "1 8")
 # env: GPU (0) OUT (h100/results/run_<ts>) DATA (~/ofa_data, cached between runs) STEPS (4000) INFER_SMS (21 = FA's 24/148 of 132)
 #      ALLOW_GPU0 (0: GPU 0 is refused unless 1)  SUDO (sudo) SERVE_RATES ("100 400": open-loop demand in tok/s for mk_paced and mk_dyn)
 set -uo pipefail
@@ -94,5 +95,27 @@ if has mps_pair; then
   dk $VLLM_IMG serve_mps_pair.log "${MPS_ENV[@]}" -e CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$INFER_PCT -- "$SV --reps 20 --out /out/serve_mps_pair.json"
   wait $tp; mps_stop
 fi
+# ---- multi-workload megakernel (llm/h100/mw): 16-job LoRA-tail training (Qwen3-4B q/v, rank 8) + one-adapter decode, ONE launch
+MW=/out/mw_h100; MWI=${MW_INFER_SMS:-33}; MWS=${MW_STEPS:-3000}; MWT=${MW_DEC_TOKENS:-3000}
+MW_TRAIN_PCT=$(( (100 * (TOTAL - MWI) + TOTAL / 2) / TOTAL )); MW_INFER_PCT=$(( (100 * MWI + TOTAL / 2) / TOTAL ))
+has build_mw && dk $PT_IMG build_mw.log -- "cd llm/h100/mw && nvcc -arch=sm_90a -O3 -std=c++17 --extended-lambda -maxrregcount=128 -Xptxas -v -o $MW mw.cu"
+if has mw; then
+  mwd() { mkdir -p "$OUT/mw/$1"; local n=$1; shift; dk $PT_IMG mw_$n.log "$@"; }
+  mwd train16 -- "timeout -k 10 600 $MW --mode train --steps 16 --dump /out/mw/train16"
+  dk $PT_IMG mw_ref.log -- "pip install -q numpy && python h100/mw_ref.py /out/mw/train16 --out /out/mw_ref.json"
+  mwd train -- "timeout -k 10 900 $MW --mode train --steps $MWS --dump /out/mw/train"
+  for B in ${MW_BATCHES:-1 8}; do
+    mwd dec_b$B -- "timeout -k 10 900 $MW --mode dec --b $B --dec-tokens $MWT --dump /out/mw/dec_b$B"
+    mwd dec_part_b$B -- "timeout -k 10 900 $MW --mode dec --b $B --dec-tokens $MWT --infer-sms $MWI --dump /out/mw/dec_part_b$B"
+    mwd co16_b$B -- "timeout -k 10 900 $MW --mode co --b $B --steps 16 --dec-tokens $MWT --infer-sms $MWI --dump /out/mw/co16_b$B"
+    mwd co_b$B -- "timeout -k 10 900 $MW --mode co --b $B --steps $MWS --dec-tokens $MWT --infer-sms $MWI --dump /out/mw/co_b$B"
+    mps_start
+    mwd mps_train_b$B "${MPS_ENV[@]}" -e CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$MW_TRAIN_PCT -- "timeout -k 10 900 $MW --mode train --steps $MWS --dump /out/mw/mps_train_b$B" & tp=$!
+    sleep 3
+    mwd mps_dec_b$B "${MPS_ENV[@]}" -e CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$MW_INFER_PCT -- "timeout -k 10 900 $MW --mode dec --b $B --dec-tokens $MWT --dump /out/mw/mps_dec_b$B"
+    wait $tp; mps_stop
+  done
+fi
+has score_mw && python3 "$ROOT/h100/mw_score.py" "$OUT"
 has score && python3 "$ROOT/h100/score.py" "$OUT" ${COSCHED_SUMMARY:+--cosched-summary "$COSCHED_SUMMARY"}
 echo "artifacts: $OUT"
