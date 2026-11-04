@@ -1,0 +1,50 @@
+{
+ "id": "ofa-codec-corun-8ecde86e7f32",
+ "repo": "nodus-compute/open-flapping-airplanes",
+ "repo_sha": "8ecde86e7f326bcfb44943549ecbd1821db81e36",
+ "branch": "devin/1793766400-h100-repro",
+ "gpus": 1,
+ "priority": 77,
+ "cwd": "/home/ubuntu/ofa-8ecde86e7f32",
+ "out": "/home/ubuntu/gpu-queue-runs/ofa-codec-corun-8ecde86e7f32",
+ "once": true,
+ "requires_free_gpus": 1,
+ "forbidden_gpu_indices": [
+  0
+ ],
+ "min_free_mib": 70000,
+ "require_gpu_name": "H100 80GB HBM3",
+ "min_driver_major": 580,
+ "sudo": false,
+ "argv": [
+  "bash",
+  "-c",
+  "cd /home/ubuntu/ofa-8ecde86e7f32 && O=$HOME/ofa-runs/codec-corun-8ecde86e7f32-$(date -u +%Y%m%dT%H%M%SZ) && GEMM=mma GPU={gpu} OUT=$O DATA=$HOME/ofa_data-codec-8ecde86e7f32 TRUNK_CKPT_SUMMARY=$O/trunk_ckpt_summary.json TRAIN_BUBBLE_DATA=$HOME/training-bubble-data PREFLIGHT_DEADLINE_S=60 TRUNK_CKPT_JOBS=1 TRUNK_CKPT_STEPS=4 TAIL_JOBS=16 CODEC_JOBS=16 CODEC_STEPS=24 CODEC_DEC_TOKENS=2048 CODEC_BATCHES=\"1 8\" CODEC_RESERVE=\"0 16\" CODEC_ATTN_BWD=cuda PHASES=\"preflight build_trunk trunk_ckpt score_trunk_ckpt codec score_codec\" bash h100/stage_chain.sh --sha 8ecde86e7f326bcfb44943549ecbd1821db81e36 --jobs 16 --prefix-run PREFIX_RUN_PATH"
+ ],
+ "prefix_run_arg": "replace PREFIX_RUN_PATH in argv with the audited wall4x training_prefix N32 seed-413 top-layers-1 run dir (config.json, summary.json, dedicated-0..15 used)",
+ "arms": [
+  "decode solo b1/b8 (real Qwen3-4B, 2048 tokens)",
+  "train-alone: shared-trunk N16 real tail, 24 steps",
+  "solo_j0 + solo16_j0..15 (loss refs)",
+  "co: one launch, --sm-split dynamic --dec real, b1/b8 x reserve 0/16"
+ ],
+ "report": "codec_summary.json: decode_tokens_per_paid_gpu_hour, train_useful_steps_per_paid_gpu_hour, U = f_decode + f_train vs 2 dedicated GPUs (1 decode, 1 shared-trunk train)",
+ "staging": "h100/stage_chain.sh: .sha/HEAD == repo_sha, PREFIX_RUN dedicated-0..15, pinned pytorch/pytorch:2.7.1-cuda12.8 pull if absent, Qwen/Qwen3-4B@1cfa9a7 into host HF cache (HF_TOKEN from host env); private DATA dir so it can run beside ofa-ckpt-chain-staged",
+ "gates": {
+  "preflight_within_first_seconds": 60,
+  "preflight_before_any_arm": true,
+  "hf_cut_hidden": true,
+  "codec_decode_tokens_bitwise_vs_solo": true,
+  "codec_losses_bitwise_vs_solo16": true,
+  "codec_p99_tpot_le_x_solo": 1.1,
+  "codec_rates_overlap": true,
+  "one_launch": true,
+  "dcgm_interval_ms": 100,
+  "zero_errors": true
+ },
+ "reports": [
+  "preflight.json",
+  "trunk_ckpt_summary.json",
+  "codec_summary.json"
+ ]
+}
