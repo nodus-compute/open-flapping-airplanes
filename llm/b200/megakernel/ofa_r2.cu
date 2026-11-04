@@ -108,17 +108,20 @@ struct Job {
 };
 
 struct Ctx {
-  Job train, dec;
+  Job train, dec, dec2;
   const uint32_t* data; u64 ntok; const uint32_t* starts; int nstarts; u64 seed;
   int* tok_in; int* tok_tgt;
   float lr_max, lr_min, beta1, beta2, eps, wd; int warmup, sched_steps;
   u64 *phase_busy, *phase_first, *phase_last; int prof_step;
   u64* step_done; float* loss_hist; u64* blk_busy; int* finished; u64* t_end;
-  int infer_sms, doom_sms, train_sms, use_decode;
+  int infer_sms, infer2_sms, doom_sms, train_sms, use_decode;
+  u64 run_ns; u64* run_start;
   u64 serve_period_ns; int lend, tok_cap;             // Nodus: open-loop serving demand (0 = closed loop) and idle-serve-block lending to training
   u64 *tok_done, *serve_base; unsigned* lent_tasks;
+  u64 serve2_period_ns; u64 *tok_done2, *serve_base2;
   const int* smid_rank;                                 // %smid -> dense SM rank (identity unless the probe found gaps)
   decode::Params<DC> dp;
+  decode::Params<DC> dp2;
   DoomCtx dm; Live* live;                               // Doom job (runs only on the Doom partition) + pinned live counters
 };
 
@@ -126,6 +129,11 @@ struct Ctx {
 __device__ __forceinline__ u64 gtimer() { u64 t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); return t; }
 __device__ __forceinline__ unsigned ld_vol(const unsigned* p) { return *reinterpret_cast<const volatile unsigned*>(p); }
 __device__ __forceinline__ u64 ld_vol64(const u64* p) { return *reinterpret_cast<const volatile u64*>(p); }
+__device__ __forceinline__ bool stopped(const Ctx& C) {
+  if (C.run_ns && gtimer() >= ld_vol64(C.run_start) + C.run_ns) atomicExch(C.finished, 1);
+  return *reinterpret_cast<volatile int*>(C.finished) != 0;
+}
+__global__ void clock_probe(u64* out) { *out = gtimer(); }
 __device__ __forceinline__ int ld_vol(const int* p) { return *reinterpret_cast<const volatile int*>(p); }
 __device__ __forceinline__ int ld_acq(const int* p) { int v; asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v; }
 __device__ __forceinline__ u64 splitmix(u64 z) { z += 0x9e3779b97f4a7c15ull; z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull; z = (z ^ (z >> 27)) * 0x94d049bb133111ebull; return z ^ (z >> 31); }
@@ -237,7 +245,7 @@ __device__ __noinline__ bool lend_train_task(const Ctx& C, char* smem, int* lc) 
   const unsigned total = (unsigned)J.limit * (unsigned)J.tps;
   if (tid == 0) {
     int res = 0, step = 0, ph = 0, local = 0;
-    if (ld_vol(C.finished) || ld_vol(J.ticket) >= total) res = -2;
+    if (stopped(C) || !C.train_sms || ld_vol(J.ticket) >= total) res = -2;
     else {
       const unsigned g = atomicAdd(const_cast<unsigned*>(J.ticket), 1u);
       if (g >= total) res = -2;
@@ -250,6 +258,7 @@ __device__ __noinline__ bool lend_train_task(const Ctx& C, char* smem, int* lc) 
         if (!(step == lc[1] && ph == lc[2])) {
           const int off = __ldg(J.dep_off + ph), cnt = __ldg(J.dep_cnt + ph);
           for (;;) {
+            if (stopped(C)) { res = -2; break; }
             bool ready = true;
             for (int k = 0; k < cnt && ready; k++) {
               const int2 e = __ldg(J.deps + off + k);
@@ -282,7 +291,7 @@ __device__ __noinline__ bool lend_train_task(const Ctx& C, char* smem, int* lc) 
     if (ph == J.last_ph && old == __ldg(J.ntasks + ph) * (step + 1) - 1) {
       C.step_done[step] = t1;
       if (C.live) C.live->steps = (unsigned)(step + 1);
-      if (step == J.limit - 1) { *C.t_end = t1; __threadfence(); *reinterpret_cast<volatile int*>(C.finished) = 1; }
+      if (step == J.limit - 1 && !C.run_ns) { *C.t_end = t1; __threadfence(); *reinterpret_cast<volatile int*>(C.finished) = 1; }
     }
   }
   __syncthreads();
@@ -293,6 +302,9 @@ __device__ __noinline__ bool lend_train_task(const Ctx& C, char* smem, int* lc) 
 __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
   __shared__ volatile int s_sel[4];
   const int tid = threadIdx.x;
+  const u64 period = job_id == 2 ? C.serve2_period_ns : C.serve_period_ns;
+  u64* const serve_base = job_id == 2 ? C.serve_base2 : C.serve_base;
+  u64* const tok_done = job_id == 2 ? C.tok_done2 : C.tok_done;
   int cph = 0, rstep = -1, rph = -1;                    // thread 0: phase cache and "this (step, phase) is known ready"
 #if OFA_NODUS_DYN
   int pend = 0; unsigned pend_g = 0; int lcache[3] = {0, -1, -1};   // thread 0: held decode ticket while lending; lending phase cache
@@ -307,7 +319,7 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
       // Unconditional fetch-add claim: never retries (the CAS version serialised all blocks at ~2 claims/us). Dependencies always point to
       // LOWER tickets (phases are topologically ordered, step s+1 depends on step s), so a block that holds a claim while its inputs are
       // not finished cannot deadlock: the lowest unfinished ticket always has all its dependencies finished.
-      if (job_id == 1 && ld_vol(C.finished)) { res = -2; }
+      if ((job_id > 0 || C.run_ns) && stopped(C)) { res = -2; }
       else {
 #if OFA_NODUS_DYN
         unsigned g;
@@ -324,6 +336,7 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
           if (!(step == rstep && ph == rph)) {
             const int off = __ldg(J.dep_off + ph), cnt = __ldg(J.dep_cnt + ph);
             for (;;) {
+              if (C.run_ns && stopped(C)) { res = -2; break; }
               bool ready = true;
               for (int k = 0; k < cnt && ready; k++) {
                 const int2 e = __ldg(J.deps + off + k);
@@ -331,25 +344,25 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
                 if (need > 0 && ld_acq(J.done + e.x) < need) ready = false;
               }
 #if OFA_NODUS_DYN
-              if (ready && job_id == 1 && C.serve_period_ns && ph == 0 && step > 0) {   // open-loop demand: token `step` is due at base + step * period
-                const u64 base = ld_vol64(C.serve_base);
+              if (ready && job_id > 0 && period && ph == 0 && (step > 0 || C.run_ns)) {
+                const u64 base = ld_vol64(C.run_ns ? C.run_start : serve_base);
                 if (base == 0) ready = false;
-                else if (gtimer() < base + (u64)step * C.serve_period_ns) {
+                else if (gtimer() < base + (u64)step * period) {
                   ready = false;
                   if (C.lend && !ld_vol(C.finished)) { pend = 1; pend_g = g; res = -3; break; }
                 }
               }
 #endif
               if (ready) { rstep = step; rph = ph; break; }
-              if (job_id == 1 && ld_vol(C.finished)) { res = -2; break; }
-              __nanosleep(job_id == 1 ? 60 : 100);
+              if (job_id > 0 && stopped(C)) { res = -2; break; }
+              __nanosleep(job_id > 0 ? 60 : 100);
             }
           }
         }
       }
 #else
       for (;;) {
-        if (job_id == 1 && ld_vol(C.finished)) { res = -2; break; }
+        if ((job_id > 0 || C.run_ns) && stopped(C)) { res = -2; break; }
         const unsigned g = ld_vol(J.ticket);
         if (g >= total) { res = -2; break; }
         step = (int)(g / (unsigned)J.tps); const int r = (int)(g - (unsigned)step * (unsigned)J.tps);
@@ -385,7 +398,7 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
     u64 t0 = 0;
     if (tid == 0) t0 = gtimer();
     if (job_id == 0) run_train_task(C, d, local, step, smem);
-    else decode::run_task<DC>(C.dp, d.i0, local, smem);
+    else decode::run_task<DC>(job_id == 2 ? C.dp2 : C.dp, d.i0, local, smem);
     __threadfence();
     __syncthreads();
     if (tid == 0) {
@@ -397,20 +410,20 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
       }
       const int old = atomicAdd(J.done + ph, 1);
 #if OFA_NODUS_DYN
-      if (job_id == 1 && ph == J.last_ph && old == __ldg(J.ntasks + ph) * (step + 1) - 1) {   // last task of token `step`
-        if (step < C.tok_cap) C.tok_done[step] = t1;
-        if (step == 0) { __threadfence(); *reinterpret_cast<volatile u64*>(C.serve_base) = t1; }
+      if (job_id > 0 && ph == J.last_ph && old == __ldg(J.ntasks + ph) * (step + 1) - 1) {
+        if (step < C.tok_cap) tok_done[step] = t1;
+        if (step == 0) { __threadfence(); *reinterpret_cast<volatile u64*>(serve_base) = t1; }
       }
 #endif
       if (job_id == 0 && ph == J.last_ph && old == __ldg(J.ntasks + ph) * (step + 1) - 1) {     // last task of the step
         C.step_done[step] = t1;
         if (C.live) C.live->steps = (unsigned)(step + 1);
-        if (step == J.limit - 1) { *C.t_end = t1; __threadfence(); *reinterpret_cast<volatile int*>(C.finished) = 1; }
+        if (step == J.limit - 1 && !C.run_ns) { *C.t_end = t1; __threadfence(); *reinterpret_cast<volatile int*>(C.finished) = 1; }
       }
     }
   }
   if (job_id == 0) tg::block_end();
-  if (tid == 0) C.blk_busy[blockIdx.x * 2 + job_id] = busy;
+  if (tid == 0) C.blk_busy[blockIdx.x * (C.infer2_sms ? 3 : 2) + job_id] = busy;
 }
 
 __global__ void __launch_bounds__(256, OFA_BLOCKS_PER_SM) ofa_kernel(const Ctx C) {
@@ -420,8 +433,9 @@ __global__ void __launch_bounds__(256, OFA_BLOCKS_PER_SM) ofa_kernel(const Ctx C
   char* smem = reinterpret_cast<char*>(dsm);
   const int isms = C.use_decode ? C.infer_sms : 0, dsms = C.use_decode ? C.doom_sms : 0;
   if (smid < isms) job_loop(C, C.dec, 1, smem);
-  else if (smid < isms + dsms) { if (C.dm.on) doom_loop(C.dm); else return; }       // Doom's partition
-  else if (smid < isms + dsms + C.train_sms) job_loop(C, C.train, 0, smem);
+  else if (smid < isms + C.infer2_sms) job_loop(C, C.dec2, 2, smem);
+  else if (smid < isms + C.infer2_sms + dsms) { if (C.dm.on) doom_loop(C.dm); else return; }
+  else if (smid < isms + C.infer2_sms + dsms + C.train_sms) job_loop(C, C.train, 0, smem);
   else return;                                                                       // SMs beyond the requested train share stay idle
 }
 
@@ -503,6 +517,8 @@ int main(int argc, char** argv) {
   int steps = 100, sched_steps = 4000, prof_step = -1, infer_sms = 0, doom_sms = 0, prompt_n = 0, nopt = 0, dump_every = 0, opt_mode = 2, train_sms_arg = -1; std::string split_mode = getenv("OFA_SPLIT") ? getenv("OFA_SPLIT") : "";
   std::string data_path, init_path, starts_path, dump_grads, dump_w, loss_out, text_out, prompt_path; float temp = 0.8f; u64 seed = 1234; int dec_seed_steps = 1 << 20;
   int port = 0; std::string wad_path, vocab_path, prompt_text = "Once upon a time", index_path = "index.html"; bool no_doom = false;
+  int infer2_sms = 0; double serve2_rate = 0, duration_s = 0;
+  std::string metrics_out, ready_file, go_file;
   for (int i = 1; i < argc; i++) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s) && i + 1 < argc; };
     if (is("--steps")) steps = atoi(argv[++i]); else if (is("--sched-steps")) sched_steps = atoi(argv[++i]);
@@ -515,9 +531,24 @@ int main(int argc, char** argv) {
     else if (is("--port")) port = atoi(argv[++i]); else if (is("--wad")) wad_path = argv[++i]; else if (is("--vocab")) vocab_path = argv[++i];
     else if (is("--prompt-text")) prompt_text = argv[++i]; else if (is("--index")) index_path = argv[++i];
     else if (is("--serve-rate")) serve_rate = atof(argv[++i]); else if (!strcmp(argv[i], "--lend")) lend = 1;
+    else if (is("--infer2-sms")) infer2_sms = atoi(argv[++i]);
+    else if (is("--serve2-rate")) serve2_rate = atof(argv[++i]);
+    else if (is("--duration-s")) duration_s = atof(argv[++i]);
+    else if (is("--metrics-out")) metrics_out = argv[++i];
+    else if (is("--ready-file")) ready_file = argv[++i];
+    else if (is("--go-file")) go_file = argv[++i];
     else if (!strcmp(argv[i], "--no-doom")) no_doom = true;
     else if (!strcmp(argv[i], "--no-opt")) nopt = 1; else if (is("--opt-mode")) opt_mode = atoi(argv[++i]);
   }
+  if (infer2_sms < 0 || steps < 2 || !std::isfinite(duration_s) || duration_s < 0 ||
+      (duration_s > 0 && (metrics_out.empty() || !no_doom || port || !std::isfinite(serve_rate) ||
+        !std::isfinite(serve2_rate) || (infer_sms > 0 && serve_rate <= 0) ||
+        (infer2_sms > 0 && serve2_rate <= 0))) || (infer2_sms && duration_s <= 0)) {
+    fprintf(stderr, "invalid multitask configuration: fixed duration, metrics, positive enabled rates and --no-doom required\n"); return 2;
+  }
+#if !OFA_NODUS_DYN || !CLAIM_FETCHADD
+  if (duration_s > 0) { fprintf(stderr, "fixed-window multitask requires OFA_NODUS_DYN=1 and CLAIM_FETCHADD=1\n"); return 2; }
+#endif
   cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, 0));
   const int nsm = prop.multiProcessorCount;
   {  // resolve the partition: explicit flags > env > --split/OFA_SPLIT > (none: train only)
@@ -530,11 +561,12 @@ int main(int argc, char** argv) {
       if (split_mode != "auto" && split_mode != "a100" && split_mode != "b200") { fprintf(stderr, "--split must be auto|a100|b200|none\n"); return 2; }
       SmSplit sp = split_for(split_mode.c_str(), nsm); infer_sms = sp.infer; doom_sms = sp.doom; if (train_sms_arg < 0) train_sms_arg = sp.train; src = sp.src;
     }
-    if (infer_sms + doom_sms > nsm) { fprintf(stderr, "infer %d + doom %d SMs exceed the %d SMs of this GPU\n", infer_sms, doom_sms, nsm); return 2; }
-    if (train_sms_arg < 0 || train_sms_arg > nsm - infer_sms - doom_sms) train_sms_arg = nsm - infer_sms - doom_sms;
+    if (infer_sms < 0 || doom_sms < 0 || infer_sms + infer2_sms + doom_sms > nsm) { fprintf(stderr, "serving SM budgets exceed GPU\n"); return 2; }
+    if (train_sms_arg < 0 || train_sms_arg > nsm - infer_sms - infer2_sms - doom_sms) train_sms_arg = nsm - infer_sms - infer2_sms - doom_sms;
     if (infer_sms > 0 || doom_sms > 0) printf("SM partition (%s): infer %d, doom %d, train %d, idle %d of %d SMs\n", src, infer_sms, doom_sms, train_sms_arg, nsm - infer_sms - doom_sms - train_sms_arg, nsm);
   }
   const bool use_decode = infer_sms > 0;
+  if (!infer_sms && !infer2_sms && !train_sms_arg) { fprintf(stderr, "no active workload\n"); return 2; }
   const bool doom_on = use_decode && doom_sms > 0 && !no_doom && !wad_path.empty();
   DoomCtx dm{}; unsigned char* fb_host = nullptr; Live* live_host = nullptr;
   if (!doom_on) CK(cudaDeviceSetLimit(cudaLimitStackSize, 4096));   // perf-build frames are ~1-1.8 KB/thread (spills); Doom setup raises this to 24 KB itself
@@ -550,7 +582,7 @@ int main(int argc, char** argv) {
     CK(cudaFuncSetAttribute(ofa_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM));
   }
   const int nblocks = nsm * std::min(occ, BPS);
-  g_slots = train_sms_arg * std::min(occ, BPS);
+  g_slots = env_int("OFA_GRAPH_SMS", train_sms_arg) * std::min(occ, BPS);
   {  // shared-memory opt-in limits come from the device, not from constants (A100: 164 KB/SM, 163 KB opt-in/block; H100/B200: 228 KB/SM, 227 KB opt-in/block)
     int optin = 0, per_sm = 0, reserved = 0;
     CK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
@@ -767,14 +799,17 @@ int main(int argc, char** argv) {
   // ---------------- decode job
   decode::State<DC>* dstate = nullptr; Builder Dd; std::vector<int> dprefix; int* h_out_tokens_pinned = nullptr; const int out_cap = 1 << 20;
   std::vector<int> forced;
-  if (use_decode) {
-    decode::Params<DC>& P = C.dp; memset(&P, 0, sizeof P);
-    decode::Weights& w = P.w; w.wte = Wbf + lay.wte; w.wpe = Wbf + lay.wpe; w.gf = Wbf + lay.gf;
-    for (int l = 0; l < L; l++) { w.wqkv[l] = Wbf + lay.wqkv[l]; w.wo[l] = Wbf + lay.wo[l]; w.wup[l] = Wbf + lay.wup[l]; w.wdn[l] = Wbf + lay.wdn[l]; w.g1[l] = Wbf + lay.g1[l]; w.g2[l] = Wbf + lay.g2[l]; }
-    dstate = decode::alloc_state<DC>(out_cap);
-    int* dout_dev; CK(cudaHostAlloc((void**)&h_out_tokens_pinned, out_cap * 4, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&dout_dev, h_out_tokens_pinned, 0));
-    memset(h_out_tokens_pinned, 0xFF, out_cap * 4); CK(cudaMemcpy(&dstate->out_tokens, &dout_dev, sizeof(dout_dev), cudaMemcpyHostToDevice));
-    P.st = dstate; P.temperature = temp; P.seed = seed; P.valid_vocab = VALID; P.auto_reset = 1;
+  decode::State<DC>* dstate2 = nullptr; int* tokens2 = nullptr;
+  auto setup_decode = [&](decode::Params<DC>& P, Job& J, decode::State<DC>*& state, int*& tokens, int instance, double rate) {
+    bf16* frozen = Wbf;
+    if (duration_s > 0) { frozen = dalloc<bf16>(NP); CK(cudaMemcpy(frozen, Wbf, NP * 2, cudaMemcpyDeviceToDevice)); }
+    decode::Weights& w = P.w; w.wte = frozen + lay.wte; w.wpe = frozen + lay.wpe; w.gf = frozen + lay.gf;
+    for (int l = 0; l < L; l++) { w.wqkv[l] = frozen + lay.wqkv[l]; w.wo[l] = frozen + lay.wo[l]; w.wup[l] = frozen + lay.wup[l]; w.wdn[l] = frozen + lay.wdn[l]; w.g1[l] = frozen + lay.g1[l]; w.g2[l] = frozen + lay.g2[l]; }
+    state = decode::alloc_state<DC>(out_cap);
+    int* dout_dev; CK(cudaHostAlloc((void**)&tokens, out_cap * 4, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer((void**)&dout_dev, tokens, 0));
+    memset(tokens, 0xFF, out_cap * 4); CK(cudaMemcpy(&state->out_tokens, &dout_dev, sizeof(dout_dev), cudaMemcpyHostToDevice));
+    P.st = state; P.temperature = temp; P.seed = seed + instance; P.valid_vocab = VALID; P.auto_reset = 1;
+    forced.clear(); Dd = Builder{};
     if (!prompt_path.empty()) { FILE* f = fopen(prompt_path.c_str(), "r"); int x; while (f && fscanf(f, "%d", &x) == 1) forced.push_back(x); if (f) fclose(f); }
     if (forced.empty()) forced.push_back(100257);            // <|endoftext|>
     int* dforced = dalloc<int>(forced.size()); CK(cudaMemcpy(dforced, forced.data(), forced.size() * 4, cudaMemcpyHostToDevice));
@@ -785,9 +820,14 @@ int main(int argc, char** argv) {
       Dd.add("decode", d, {p - 1}, p == 0 ? std::vector<int2>{make_int2(DC::PHASES - 1, -1)} : std::vector<int2>{});
     }
     dprefix.assign(DC::PHASES + 1, 0); for (int i = 0; i < DC::PHASES; i++) dprefix[i + 1] = dprefix[i] + Dd.ntasks[i];
-    upload_job(Dd, dprefix, 1 << 22, DC::PHASES - 1, C.dec);
-    printf("decode job: %d phases, %d tasks per token; partition: infer SMs [0,%d), doom [%d,%d), train rest\n", DC::PHASES, dprefix[DC::PHASES], infer_sms, infer_sms, infer_sms + doom_sms);
-  }
+    const u64 period = rate > 0 ? (u64)(1e9 / rate) : 0;
+    const u64 limit = duration_s > 0 && period ? 1 + ((u64)(duration_s * 1e9) - 1) / period : 1 << 22;
+    if (duration_s > 0 && (!period || limit > (u64)out_cap)) { fprintf(stderr, "serving demand exceeds token capacity\n"); exit(2); }
+    upload_job(Dd, dprefix, (int)limit, DC::PHASES - 1, J);
+    printf("serve%d: independent state, seed %llu, %d phases, %llu token requests\n", instance + 1, P.seed, DC::PHASES, limit);
+  };
+  if (use_decode) setup_decode(C.dp, C.dec, dstate, h_out_tokens_pinned, 0, serve_rate);
+  if (infer2_sms) setup_decode(C.dp2, C.dec2, dstate2, tokens2, 1, serve2_rate);
 
   C.dm = dm; C.live = dm.live;
   if (port > 0) {
@@ -801,11 +841,15 @@ int main(int argc, char** argv) {
   C.lr_max = 6e-4f; C.lr_min = 6e-5f; C.beta1 = 0.9f; C.beta2 = 0.95f; C.eps = 1e-8f; C.wd = 0.1f; C.warmup = 100; C.sched_steps = sched_steps;
   C.phase_busy = dalloc<u64>(nph); C.phase_first = dalloc<u64>(nph); C.phase_last = dalloc<u64>(nph); C.prof_step = prof_step < 0 ? steps / 2 : prof_step;
   { std::vector<u64> big(nph, ~0ull); CK(cudaMemcpy(C.phase_first, big.data(), nph * 8, cudaMemcpyHostToDevice)); }
-  C.step_done = dalloc<u64>(steps + 1); C.loss_hist = dalloc<float>(steps + 1); C.blk_busy = dalloc<u64>(nblocks * 2); C.finished = dalloc<int>(1); C.t_end = dalloc<u64>(1);
+  C.step_done = dalloc<u64>(steps + 1); C.loss_hist = dalloc<float>(steps + 1); C.blk_busy = dalloc<u64>(nblocks * (infer2_sms ? 3 : 2)); C.finished = dalloc<int>(1); C.t_end = dalloc<u64>(1);
   C.infer_sms = infer_sms; C.doom_sms = doom_sms; C.train_sms = train_sms_arg; C.use_decode = use_decode; C.smid_rank = d_rank;
   C.dm.finished = C.finished;
   C.serve_period_ns = serve_rate > 0 ? (u64)(1e9 / serve_rate) : 0; C.lend = lend; C.tok_cap = 1 << 20;
   C.tok_done = dalloc<u64>(C.tok_cap); C.serve_base = dalloc<u64>(1); C.lent_tasks = dalloc<unsigned>(1);
+  C.infer2_sms = infer2_sms; C.run_ns = (u64)(duration_s * 1e9); C.run_start = dalloc<u64>(1);
+  C.serve2_period_ns = serve2_rate > 0 ? (u64)(1e9 / serve2_rate) : 0;
+  C.tok_done2 = dalloc<u64>(C.tok_cap); C.serve_base2 = dalloc<u64>(1);
+  if ((u64)C.train.tps * steps > 0xffffffffull) { fprintf(stderr, "training ticket overflow: reduce --steps\n"); return 2; }
 #if !OFA_NODUS_DYN
   if (serve_rate > 0 || lend) { fprintf(stderr, "--serve-rate/--lend need a -DOFA_NODUS_DYN=1 build\n"); return 2; }
 #endif
@@ -814,6 +858,33 @@ int main(int argc, char** argv) {
 #endif
   if (serve_rate > 0 || lend) printf("serving demand: %s, lending %s\n", serve_rate > 0 ? "open-loop paced" : "closed loop", C.lend ? "on" : "off");
   CK(cudaDeviceSynchronize());
+
+  auto wall_now = []() { return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); };
+  double clock_error_s = 0;
+  if (duration_s > 0) {
+    u64 tick = 0; double calibrated = 0; clock_error_s = 1e30;
+    for (int sample = 0; sample < 5; sample++) {
+      const double before = wall_now();
+      clock_probe<<<1, 1>>>(C.run_start);
+      u64 probe; CK(cudaMemcpy(&probe, C.run_start, 8, cudaMemcpyDeviceToHost));
+      const double after = wall_now(), error = (after - before) / 2;
+      if (error < clock_error_s) { tick = probe; calibrated = (before + after) / 2; clock_error_s = error; }
+    }
+    if (!ready_file.empty()) { std::ofstream f(ready_file); f << getpid() << "\n"; if (!f) return 2; }
+    double target = wall_now() + 0.1;
+    if (!go_file.empty()) {
+      const double timeout = wall_now() + 600;
+      for (;;) {
+        std::ifstream f(go_file);
+        if (f >> target) break;
+        if (wall_now() > timeout) { fprintf(stderr, "start barrier timeout\n"); return 2; }
+        usleep(10000);
+      }
+    }
+    const u64 start = tick + (u64)(std::max(0.0, target - calibrated) * 1e9);
+    CK(cudaMemcpy(C.run_start, &start, 8, cudaMemcpyHostToDevice));
+    while (wall_now() < target) usleep(1000);
+  }
 
   // ---------------- run: ONE launch
   printf("launching ONE persistent kernel (%d blocks)...\n", nblocks);
@@ -830,6 +901,34 @@ int main(int argc, char** argv) {
   dash::phase = 3;
   float ms; CK(cudaEventElapsedTime(&ms, e0, e1));
   const double wall = now_s() - tw0;
+
+  if (duration_s > 0) {
+    FILE* f = fopen(metrics_out.c_str(), "w");
+    if (!f) { perror("metrics-out"); return 2; }
+    u64 start; CK(cudaMemcpy(&start, C.run_start, 8, cudaMemcpyDeviceToHost));
+    fprintf(f, "kind,workload,index,arrival_s,done_s,latency_s,token,loss\n");
+    fprintf(f, "clock,all,0,0,%.9f,%.9f,0,0\n", duration_s, clock_error_s);
+    auto emit = [&](int instance, const Job& J, u64* done, u64 period, int* tokens) {
+      std::vector<u64> td(J.limit); CK(cudaMemcpy(td.data(), done, J.limit * 8, cudaMemcpyDeviceToHost));
+      for (int s = 0; s < J.limit; s++) {
+        const double arrival = (double)((u64)s * period) * 1e-9;
+        const bool complete = td[s] >= start && td[s] <= start + C.run_ns;
+        const double end = complete ? (double)(td[s] - start) * 1e-9 : -1;
+        fprintf(f, "serve,serve%d,%d,%.9f,%.9f,%.9f,%d,0\n", instance, s, arrival, end, complete ? end - arrival : -1, complete ? tokens[s] : -1);
+      }
+    };
+    if (use_decode) emit(1, C.dec, C.tok_done, C.serve_period_ns, h_out_tokens_pinned);
+    if (infer2_sms) emit(2, C.dec2, C.tok_done2, C.serve2_period_ns, tokens2);
+    std::vector<float> loss(steps); std::vector<u64> sd(steps);
+    CK(cudaMemcpy(loss.data(), C.loss_hist, steps * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(sd.data(), C.step_done, steps * 8, cudaMemcpyDeviceToHost));
+    for (int s = 0; s < steps; s++) if (sd[s] >= start && sd[s] <= start + C.run_ns)
+      fprintf(f, "train,train,%d,0,%.9f,0,0,%.9g\n", s, (double)(sd[s] - start) * 1e-9, loss[s]);
+    if (train_sms_arg && sd.back()) fprintf(f, "error,train,%d,0,0,0,0,0\n", steps);
+    fclose(f);
+    printf("MEASURED fixed window %.3f s, event %.3f s, clock uncertainty %.6f s, metrics %s\n", duration_s, ms / 1e3, clock_error_s, metrics_out.c_str());
+    return 0;
+  }
 
   // ---------------- results
   std::vector<float> loss(steps); CK(cudaMemcpy(loss.data(), C.loss_hist, steps * 4, cudaMemcpyDeviceToHost));
