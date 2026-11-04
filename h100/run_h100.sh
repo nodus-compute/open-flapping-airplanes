@@ -223,5 +223,35 @@ if has wgmma; then
   done
 fi
 has score_wgmma && python3 "$ROOT/h100/wgmma_score.py" "$OUT"
+
+# ---- shared trunk inside the persistent megakernel: frozen trunk (TRUNK_LAYERS Qwen3-4B-width MLP GEMM pairs) once per step for N LoRA jobs ----
+TR=/out/trunk_h100; TRN=${TRUNK_JOBS:-8 16 32}; TRL=${TRUNK_LAYERS:-8}; TRS=${TRUNK_STEPS:-200}; TRB=${TRUNK_BATCHES:-1 8}; TRT=${TRUNK_DEC_TOKENS:-2048}
+has build_trunk && dk $PT_IMG build_trunk.log -- "cd llm/h100/trunk && nvcc -arch=sm_90a -O3 -std=c++17 --extended-lambda -maxrregcount=128 -Xptxas -v $GFLAG -o $TR trunk.cu"
+if has trunk; then
+  trd() { mkdir -p "$OUT/trunk/$1"; local n=$1; shift; dk $PT_IMG trunk_$n.log "$@"; }
+  TA="--trunk-layers $TRL"; NMAX=$(printf '%s\n' $TRN | sort -n | tail -1)
+  for J in $(seq 0 $((NMAX - 1))); do   # dedicated calibration: each job alone on the GPU (bitwise ref + timed rate)
+    trd solo16_j$J -- "timeout -k 10 600 $TR --mode train --jobs 1 --job-base $J $TA --steps 16 --dump /out/trunk/solo16_j$J"
+    dcgm_on trunk_solo_j$J; trd solo_j$J -- "timeout -k 10 900 $TR --mode train --jobs 1 --job-base $J $TA --steps $TRS --dump /out/trunk/solo_j$J"; dcgm_off
+  done
+  for B in $TRB; do dcgm_on trunk_dec_b$B; trd dec_b$B -- "timeout -k 10 900 $TR --mode dec --b $B --dec-tokens $TRT --dump /out/trunk/dec_b$B"; dcgm_off; done
+  for N in $TRN; do
+    for A in perjob shared; do
+      trd ${A}16_n$N -- "timeout -k 10 600 $TR --mode train --jobs $N --trunk $A $TA --steps 16 --dump /out/trunk/${A}16_n$N"
+      dcgm_on trunk_${A}_n$N; trd ${A}_n$N -- "timeout -k 10 900 $TR --mode train --jobs $N --trunk $A $TA --steps $TRS --dump /out/trunk/${A}_n$N"; dcgm_off
+    done
+    for B in $TRB; do
+      CO="--mode co --jobs $N --trunk shared $TA --b $B --dec-tokens $TRT --infer-sms $MWI"
+      trd co16_n${N}_b$B -- "timeout -k 10 900 $TR $CO --steps 16 --dump /out/trunk/co16_n${N}_b$B"
+      dcgm_on trunk_co_n${N}_b$B; trd co_n${N}_b$B -- "timeout -k 10 900 $TR $CO --steps $TRS --dump /out/trunk/co_n${N}_b$B"; dcgm_off
+      mps_start; dcgm_on trunk_mps_n${N}_b$B
+      trd mps_train_n${N}_b$B "${MPS_ENV[@]}" -e CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$MW_TRAIN_PCT -- "timeout -k 10 900 $TR --mode train --jobs $N --trunk shared $TA --steps $TRS --dump /out/trunk/mps_train_n${N}_b$B" & tp=$!
+      sleep 3
+      trd mps_dec_n${N}_b$B "${MPS_ENV[@]}" -e CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$MW_INFER_PCT -- "timeout -k 10 900 $TR --mode dec --b $B --dec-tokens $TRT --dump /out/trunk/mps_dec_n${N}_b$B"
+      wait $tp; dcgm_off; mps_stop
+    done
+  done
+fi
+has score_trunk && python3 "$ROOT/h100/trunk_score.py" "$OUT"
 has score && python3 "$ROOT/h100/score.py" "$OUT" ${COSCHED_SUMMARY:+--cosched-summary "$COSCHED_SUMMARY"}
 echo "artifacts: $OUT"
