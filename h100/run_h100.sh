@@ -309,7 +309,7 @@ if has trunk_tail && ckpt_gate trunk_tail; then
   mkdir -p "$OUT/ttl/data"
   dk $PT_IMG ttl_prep.log -v "$HFC":/root/.cache/huggingface -v "$TBD":/tbd:ro -v "$PREFIX_RUN":/prefix:ro -e HF_TOKEN -- \
     "$TCPREP && python h100/tail_prep.py --data /tbd --prefix-run /prefix --out /out/ttl/data --steps $TTS --jobs $TTM"
-  TTA="$TCB --tail real --tail-data /out/ttl/data --attn ${TRUNK_ATTN:-cuda}"
+  TTA="$TCB --tail real --tail-data /out/ttl/data --attn ${TRUNK_ATTN:-cuda} --attn-bwd ${TRUNK_ATTN_BWD:-cuda}"
   ttd() { mkdir -p "$OUT/ttl/$1"; local n=$1; shift; dk $PT_IMG ttl_$n.log "$@"; }
   for J in $(seq 0 $((TTM - 1))); do ttd solo16_j$J -- "timeout -k 10 1800 $TR --mode train --jobs 1 --job-base $J $TTA --steps 16 --dump /out/ttl/solo16_j$J"; done
   dcgm_on ttl_solo_j0; ttd solo_j0 -- "timeout -k 10 3600 $TR --mode train --jobs 1 $TTA --steps $TTS"; dcgm_off
@@ -330,6 +330,24 @@ if has trunk_attn && ckpt_gate trunk_attn; then
   done
 fi
 has score_trunk_attn && python3 "$ROOT/h100/trunk_attn_score.py" "$OUT"
+# tensor-core attention backward (--attn-bwd tc) vs the CUDA-core backward: 1-step grads (declared tolerance), 16-step losses vs cuda and the
+#   training_prefix dedicated-0 arm, tc twice bitwise, per-kind max tile time and N-job steps/s. Gated on the real-trunk cut-hidden result.
+TBN=${TRUNK_BWD_JOBS:-8}
+if has trunk_bwd && ckpt_gate trunk_bwd; then
+  [ -n "${PREFIX_RUN:-}" ] && [ -f "$PREFIX_RUN/config.json" ] || { echo "PREFIX_RUN must be the audited training_prefix run dir (config.json, summary.json)"; exit 2; }
+  TBD=${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}; mkdir -p "$OUT/tbw/data"
+  dk $PT_IMG tbw_prep.log -v "$HFC":/root/.cache/huggingface -v "$TBD":/tbd:ro -v "$PREFIX_RUN":/prefix:ro -e HF_TOKEN -- \
+    "$TCPREP && python h100/tail_prep.py --data /tbd --prefix-run /prefix --out /out/tbw/data --steps 16 --jobs $TBN"
+  TBA="$TCB --tail real --tail-data /out/tbw/data --attn ${TRUNK_ATTN:-cuda}"
+  tbd() { mkdir -p "$OUT/tbw/$1"; local n=$1; shift; dk $PT_IMG tbw_$n.log "$@"; }
+  for AB in cuda tc; do
+    tbd g1_$AB -- "timeout -k 10 900 $TR --mode train --jobs 1 $TBA --attn-bwd $AB --steps 1 --dump /out/tbw/g1_$AB"
+    tbd l16_$AB -- "timeout -k 10 1800 $TR --mode train --jobs 1 $TBA --attn-bwd $AB --steps 16 --dump /out/tbw/l16_$AB"
+    dcgm_on tbw_n${TBN}_$AB; tbd n${TBN}_$AB -- "timeout -k 10 3600 $TR --mode train --jobs $TBN $TBA --attn-bwd $AB --steps 16 --dump /out/tbw/n${TBN}_$AB"; dcgm_off
+  done
+  tbd l16_tc2 -- "timeout -k 10 1800 $TR --mode train --jobs 1 $TBA --attn-bwd tc --steps 16 --dump /out/tbw/l16_tc2"
+fi
+has score_trunk_bwd && python3 "$ROOT/h100/trunk_bwd_score.py" "$OUT" ${PREFIX_RUN:+--prefix-run "$PREFIX_RUN"}
 # real Qwen3-4B decode + real-tail shared-trunk training co-executing in ONE launch (--dec real --sm-split dynamic): decode instructions first,
 #   trunk/tail tiles fill idle SMs; --dec-reserve R keeps blocks [0, R) decode-only. Gated on the real-trunk cut-hidden result.
 CDN=${CODEC_JOBS:-16}; CDS=${CODEC_STEPS:-24}; CDT=${CODEC_DEC_TOKENS:-2048}; CDB=${CODEC_BATCHES:-1 8}; CDR=${CODEC_RESERVE:-0 16}
@@ -338,7 +356,7 @@ if has codec && ckpt_gate codec; then
   TBD=${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}; mkdir -p "$OUT/cdc/data"
   dk $PT_IMG cdc_prep.log -v "$HFC":/root/.cache/huggingface -v "$TBD":/tbd:ro -v "$PREFIX_RUN":/prefix:ro -e HF_TOKEN -- \
     "$TCPREP && python h100/tail_prep.py --data /tbd --prefix-run /prefix --out /out/cdc/data --steps $CDS --jobs $CDN"
-  CTA="$TCB --tail real --tail-data /out/cdc/data --attn ${TRUNK_ATTN:-cuda}"
+  CTA="$TCB --tail real --tail-data /out/cdc/data --attn ${TRUNK_ATTN:-cuda} --attn-bwd ${TRUNK_ATTN_BWD:-cuda}"
   cdd() { mkdir -p "$OUT/cdc/$1"; local n=$1; shift; dk $PT_IMG cdc_$n.log "$@"; }
   for J in $(seq 0 $((CDN - 1))); do cdd solo16_j$J -- "timeout -k 10 1800 $TR --mode train --jobs 1 --job-base $J $CTA --steps 16 --dump /out/cdc/solo16_j$J"; done
   dcgm_on cdc_solo_j0; cdd solo_j0 -- "timeout -k 10 3600 $TR --mode train --jobs 1 $CTA --steps $CDS --dump /out/cdc/solo_j0"; dcgm_off
