@@ -31,6 +31,7 @@ def main():
     ap.add_argument("--top-layers", type=int, default=1)
     ap.add_argument("--seed", type=int, default=413)
     ap.add_argument("--hidden", type=int, default=2560)
+    ap.add_argument("--lr-cycle", action="store_true", help="jobs past the prefix run's count reuse its learning rates cyclically (own seed-derived adapter init)")
     a = ap.parse_args()
     cfg = {}
     if a.prefix_run and (a.prefix_run / "config.json").exists():
@@ -43,6 +44,8 @@ def main():
     if lrs is None:
         span = min(3, a.jobs - 1)
         lrs = [1e-4 * 2 ** (span * j / (a.jobs - 1) - span / 2) if a.jobs > 1 else 1e-4 for j in range(a.jobs)]
+    if lrs and a.lr_cycle:
+        lrs = [lrs[j % len(lrs)] for j in range(max(a.jobs, len(lrs)))]
     if len(lrs) < a.jobs:
         raise SystemExit(f"prefix run has {len(lrs)} jobs < {a.jobs}")
     tok = AutoTokenizer.from_pretrained(str(a.data / "models" / a.train_size))

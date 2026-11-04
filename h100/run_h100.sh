@@ -36,15 +36,16 @@ if has preflight; then
   PFD=${PREFLIGHT_DEADLINE_S:-60}; PFL=$((PFD - SECONDS)); PFJ=0
   if has trunk_tail || has codec || has trunk_bwd; then for v in ${TAIL_JOBS:-8 16 32} ${CODEC_JOBS:-16} ${TRUNK_BWD_JOBS:-8}; do [ "$v" -gt "$PFJ" ] && PFJ=$v; done; fi
   [ "$PFL" -gt 0 ] && timeout -k 5 "$PFL" python3 "$ROOT/h100/preflight.py" --out "$OUT" --gpu "$GPU" --img "$PT_IMG" --sudo "$SUDO" --deadline-s "$PFL" \
-    --jobs "$PFJ" ${PREFIX_RUN:+--prefix-run "$PREFIX_RUN"} --train-data "${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}" \
+    --jobs "${PREFIX_JOBS:-$PFJ}" ${PREFIX_RUN:+--prefix-run "$PREFIX_RUN"} --train-data "${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}" \
     --hf-cache "${HF_CACHE:-$HOME/.cache/huggingface}" --revision 1cfa9a7208912126459214e8b04321603b3df60c --data "$DATA" \
     || { echo "preflight failed (see $OUT/preflight.json)"; exit 7; }
 fi
 # dk IMG LOG [docker args...] -- cmd   (cmd runs under bash -c, cwd /src)
-dk() { local img=$1 log=$2; shift 2; local extra=(); while [ "$1" != -- ]; do extra+=("$1"); shift; done; shift
+dk() { local img=$1 log=$2 t0; t0=$(date +%s.%N); shift 2; local extra=(); while [ "$1" != -- ]; do extra+=("$1"); shift; done; shift
   $SUDO docker run --rm --gpus "\"device=$GPU\"" --ipc=host --entrypoint bash -e HOME=/root -e DATA_DIR=/root/data -e MODEL=S \
     -e TOTAL_SMS=$TOTAL -e TRAIN_SMS=$TRAIN -e INFER_SMS=$INFER -e PYTHONUNBUFFERED=1 -v "$ROOT":/src -v "$DATA":/root/data -v "$OUT":/out \
-    "${extra[@]}" -w /src "$img" -c "$*" > "$OUT/$log" 2>&1; local rc=$?; echo "$log rc=$rc: $(tail -1 "$OUT/$log" | cut -c1-160)"; return $rc; }
+    "${extra[@]}" -w /src "$img" -c "$*" > "$OUT/$log" 2>&1; local rc=$?
+  printf 'start %s\nend %s\nrc %s\n' "$t0" "$(date +%s.%N)" "$rc" > "$OUT/${log%.log}.wall"; echo "$log rc=$rc: $(tail -1 "$OUT/$log" | cut -c1-160)"; return $rc; }
 MPS_ENV=(-e CUDA_MPS_PIPE_DIRECTORY=/mps/pipe -v "$MPSDIR":/mps)
 mps_start() { $SUDO env CUDA_VISIBLE_DEVICES=$GPU CUDA_MPS_PIPE_DIRECTORY=$MPSDIR/pipe CUDA_MPS_LOG_DIRECTORY=$MPSDIR/log nvidia-cuda-mps-control -d; sleep 2; }
 mps_stop() { echo quit | $SUDO env CUDA_MPS_PIPE_DIRECTORY=$MPSDIR/pipe nvidia-cuda-mps-control; sleep 2; }
@@ -364,7 +365,7 @@ if has codec && ckpt_gate codec; then
   [ -n "${PREFIX_RUN:-}" ] && [ -f "$PREFIX_RUN/config.json" ] || { echo "PREFIX_RUN must be the audited training_prefix run dir (config.json, summary.json)"; exit 2; }
   TBD=${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}; mkdir -p "$OUT/cdc/data"
   dk $PT_IMG cdc_prep.log -v "$HFC":/root/.cache/huggingface -v "$TBD":/tbd:ro -v "$PREFIX_RUN":/prefix:ro -e HF_TOKEN -- \
-    "$TCPREP && python h100/tail_prep.py --data /tbd --prefix-run /prefix --out /out/cdc/data --steps $CDS --jobs $CDN"
+    "$TCPREP && python h100/tail_prep.py --data /tbd --prefix-run /prefix --out /out/cdc/data --steps $CDS --jobs $CDN ${CODEC_LR_CYCLE:+--lr-cycle}"
   cdd() { mkdir -p "$OUT/cdc/$1"; local n=$1; shift; dk $PT_IMG cdc_$n.log "$@"; }
   CTA="$TCB --tail real --tail-data /out/cdc/data --attn ${TRUNK_ATTN:-cuda}"
   for B in $CDB; do
