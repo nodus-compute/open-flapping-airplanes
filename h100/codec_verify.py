@@ -7,6 +7,8 @@ Writes nothing. Recomputes from raw artifacts, not from codec_summary.json numbe
   2 dedicated GPUs = 1.0 per paid GPU-hour; co_vs_time_slice = U_co / U_ts; best co arm (reserve) per b.
 Real-H100 evidence: preflight.json passed with gpu_name containing H100 80GB HBM3 and the in-container MATMUL_OK; trunk_ckpt_summary
 hf_cut_hidden; every arm rc 0; DCGM/nvidia-smi 100 ms samples covering >= 50% of each gated arm's billed time.
+CODEC_PREFILL=1 bundles (pf solo present): prefill tokens = chunks done x chunk tokens (prefill log lines, all chunks done), pf_out.bf16
+byte-equal to pf solo in every co arm and the time-slice third process, U adds f_prefill, the dedicated baseline is 3 GPUs (1.0 per paid GPU-hour).
 Gates rechecked: decode ids bitwise vs solo and per-job first-16 losses bitwise vs solo16 (co and time-slice), p99 TPOT <= 1.10x solo,
 decode outlasts training (co), one launch, zero errors; and codec_summary.json itself passed with the same gate names true.
 """
@@ -20,6 +22,8 @@ from pathlib import Path
 from codec_score import PRE, dec, losses_ok, u64s
 from trunk_ckpt_score import log, raw
 
+PFT = re.compile(r"prefill: (\d+) chunks x (\d+) tokens")
+PFD = re.compile(r"prefill: (\d+) of (\d+) chunks done")
 STEPS = re.compile(r"decode: b=(\d+), (\d+) token steps")
 
 
@@ -69,6 +73,9 @@ def main():
     n = len(solos)
     need("solo16_refs", n > 0 and solos == list(range(n)), solos[:4])
 
+    def per_s(x, s):
+        return x / s if x and s else None
+
     def billed(*names):
         w = [wall(out, x) for x in names]
         if not all(w):
@@ -88,14 +95,27 @@ def main():
         need(f"losses_{name}", bool(b))
         return len(b) // 4 if b else None
 
-    def per_s(x, s):
-        return x / s if x and s else None
-
     t_alone_s = billed("train")
     r_train = per_s(job_steps("train"), t_alone_s)
     for x in ["train", *(f"solo16_j{j}" for j in solos)]:
         billed(x)
     dc_ok = {"train": dcgm_ok(out, "train", t_alone_s)}
+    r_pf = pf_solo = None
+    def pf_tokens(name):
+        t = log(out, name, PRE)
+        m, k = PFT.search(t), PFD.search(t)
+        need(f"prefill_{name}", bool(m and k) and k.group(1) == k.group(2) and bool(raw(out, name, "pf_out.bf16", PRE)))
+        return int(k.group(1)) * int(m.group(2)) if m and k else None
+
+    has_pf = bool(log(out, "pf", PRE))
+    if has_pf:
+        need("summary_gate_prefill_bitwise", bool(sm and sm.get("gates", {}).get("prefill_bitwise")))
+        need("summary_gate_ts_prefill_bitwise", bool(sm and sm.get("gates", {}).get("ts_prefill_bitwise")))
+        pf_s = billed("pf")
+        r_pf = per_s(pf_tokens("pf"), pf_s)
+        pf_solo = raw(out, "pf", "pf_out.bf16", PRE)
+        dc_ok["pf"] = dcgm_ok(out, "pf", pf_s)
+
     by_b = {}
     for p in sorted(d.glob("co_b*_r*")) if d.is_dir() else []:
         m = re.match(r"co_b(\d+)_r(\d+)$", p.name)
@@ -110,19 +130,27 @@ def main():
         dc_ok[f"dec_b{b}"] = dcgm_ok(out, f"dec_b{b}", sd_s)
         toks_solo = raw(out, f"dec_b{b}", "toks.i32", PRE)
 
-        def u(name, secs, tok_name, trn_name):
+        def u(name, secs, tok_name, trn_name, pf_name=None):
             rd, rt = per_s(tokens(tok_name), secs), per_s(job_steps(trn_name), secs)
             fd, ft = (rd / r_dec if rd and r_dec else None), (rt / r_train if rt and r_train else None)
+            rp = fp = None
+            if has_pf:
+                rp = per_s(pf_tokens(pf_name), secs)
+                fp = rp / r_pf if rp and r_pf else None
+                need(f"bitwise_prefill_{pf_name}", bool(pf_solo) and raw(out, pf_name, "pf_out.bf16", PRE) == pf_solo)
+                if fp is None:
+                    fd = None
             need(f"bitwise_tokens_{tok_name}", bool(toks_solo) and raw(out, tok_name, "toks.i32", PRE) == toks_solo)
             need(f"bitwise_losses_{trn_name}", losses_ok(out, trn_name, solos, ""))
             return dict(arm=name, billed_s=secs, decode_tokens_per_paid_gpu_hour=3600 * rd if rd else None,
                         job_steps_per_paid_gpu_hour=3600 * rt if rt else None, f_decode=fd, f_train=ft,
-                        U=fd + ft if fd is not None and ft is not None else None)
+                        prefill_tokens_per_paid_gpu_hour=3600 * rp if rp else None, f_prefill=fp,
+                        U=fd + ft + (fp or 0.0) if fd is not None and ft is not None else None)
 
         rows = []
         for rs, name in arms:
             s = billed(name)
-            r = u(name, s, name, name)
+            r = u(name, s, name, name, name)
             r["reserve"] = rs
             t = log(out, name, PRE)
             dcx = dec(t)
@@ -132,15 +160,17 @@ def main():
             need(f"one_launch_{name}", "kernel launches 1 for" in t)
             dc_ok[name] = dcgm_ok(out, name, s)
             rows.append(r)
-        ts_s = billed(f"ts_dec_b{b}", f"ts_train_b{b}")
-        ts = u(f"ts_b{b}", ts_s, f"ts_dec_b{b}", f"ts_train_b{b}")
+        ts_s = billed(f"ts_dec_b{b}", f"ts_train_b{b}", *([f"ts_pf_b{b}"] if has_pf else []))
+        ts = u(f"ts_b{b}", ts_s, f"ts_dec_b{b}", f"ts_train_b{b}", f"ts_pf_b{b}")
         dc_ok[f"ts_b{b}"] = dcgm_ok(out, f"ts_b{b}", ts_s)
         best = max((r for r in rows if r["U"] is not None), key=lambda r: r["U"], default=None)
         cvt = best["U"] / ts["U"] if best and ts["U"] else None
         need(f"co_vs_time_slice_b{b}", cvt is not None and cvt >= a.min_co_vs_time_slice, cvt)
         cmp.append(dict(b=b, co_rows=rows, best_co=best and best["arm"], time_slice=ts,
-                        dedicated_2gpu=dict(U=1.0, decode_tokens_per_paid_gpu_hour=1800 * r_dec if r_dec else None,
-                                            job_steps_per_paid_gpu_hour=1800 * r_train if r_train else None),
+                        dedicated=dict(gpus=3 if has_pf else 2, U=1.0,
+                                       decode_tokens_per_paid_gpu_hour=3600 * r_dec / (3 if has_pf else 2) if r_dec else None,
+                                       job_steps_per_paid_gpu_hour=3600 * r_train / (3 if has_pf else 2) if r_train else None,
+                                       prefill_tokens_per_paid_gpu_hour=3600 * r_pf / 3 if has_pf and r_pf else None),
                         co_vs_time_slice=cvt, co_vs_2_dedicated=best and best["U"],
                         summary_co_vs_time_slice=next((c.get("co_vs_time_slice") for c in (sm or {}).get("comparison", []) if c.get("b") == b), None),
                         summary_co_vs_2_dedicated=next((c.get("co_vs_2_dedicated") for c in (sm or {}).get("comparison", []) if c.get("b") == b), None)))

@@ -364,13 +364,16 @@ CDN=${CODEC_JOBS:-16}; CDS=${CODEC_STEPS:-24}; CDT=${CODEC_DEC_TOKENS:-2048}; CD
 if has codec && ckpt_gate codec; then
   [ -n "${PREFIX_RUN:-}" ] && [ -f "$PREFIX_RUN/config.json" ] || { echo "PREFIX_RUN must be the audited training_prefix run dir (config.json, summary.json)"; exit 2; }
   TBD=${TRAIN_BUBBLE_DATA:-$HOME/training-bubble-data}; mkdir -p "$OUT/cdc/data"
+  PFC=; PFA=   # CODEC_PREFILL=1: third tenant, Qwen3-4B prefill chunks (next rows of the same trace) through all 36 layers, solo / co / time-slice
+  if [ "${CODEC_PREFILL:-0}" = 1 ]; then CDP=${CODEC_PREFILL_CHUNKS:-$CDS}; PFC="--prefill-chunks $CDP"; PFA="--prefill-chunks $CDP --prefill-data /out/cdc/data/prefill_tokens.i32"; fi
   dk $PT_IMG cdc_prep.log -v "$HFC":/root/.cache/huggingface -v "$TBD":/tbd:ro -v "$PREFIX_RUN":/prefix:ro -e HF_TOKEN -- \
-    "$TCPREP && python h100/tail_prep.py --data /tbd --prefix-run /prefix --out /out/cdc/data --steps $CDS --jobs $CDN ${CODEC_LR_CYCLE:+--lr-cycle}"
+    "$TCPREP && python h100/tail_prep.py --data /tbd --prefix-run /prefix --out /out/cdc/data --steps $CDS --jobs $CDN ${CODEC_LR_CYCLE:+--lr-cycle} $PFC"
   cdd() { mkdir -p "$OUT/cdc/$1"; local n=$1; shift; dk $PT_IMG cdc_$n.log "$@"; }
   CTA="$TCB --tail real --tail-data /out/cdc/data --attn ${TRUNK_ATTN:-cuda}"
   for B in $CDB; do
     dcgm_on cdc_dec_b$B; cdd dec_b$B -- "timeout -k 10 1800 $TR --mode dec --dec real $CTA --b $B --ctx 1 --dec-tokens $CDT --infer-sms 9999 --dump /out/cdc/dec_b$B"; dcgm_off
   done
+  if [ -n "$PFA" ]; then dcgm_on cdc_pf; cdd pf -- "timeout -k 10 3600 $TR --mode pf --dec real $CTA $PFA --dump /out/cdc/pf"; dcgm_off; fi
   for AB in $CDA; do
     SX=; [ "$AB" = tc ] && SX=_bt
     CTB="$CTA --attn-bwd $AB"
@@ -379,7 +382,7 @@ if has codec && ckpt_gate codec; then
     dcgm_on cdc_train$SX; cdd train$SX -- "timeout -k 10 7200 $TR --mode train --jobs $CDN $CTB --steps $CDS --dump /out/cdc/train$SX"; dcgm_off
     for B in $CDB; do for RS in $CDR; do
       dcgm_on cdc_co_b${B}_r$RS$SX
-      cdd co_b${B}_r$RS$SX -- "timeout -k 10 7200 $TR --mode co --sm-split dynamic --dec real --dec-reserve $RS --jobs $CDN $CTB --b $B --ctx 1 --dec-tokens $CDT --steps $CDS --dump /out/cdc/co_b${B}_r$RS$SX"
+      cdd co_b${B}_r$RS$SX -- "timeout -k 10 7200 $TR --mode co --sm-split dynamic --dec real --dec-reserve $RS --jobs $CDN $CTB --b $B --ctx 1 --dec-tokens $CDT --steps $CDS $PFA --dump /out/cdc/co_b${B}_r$RS$SX"
       dcgm_off
     done; done
     # stock baseline: the same decode and training as 2 separate processes time-sliced on this GPU (no MPS); host start/end per process
@@ -388,7 +391,9 @@ if has codec && ckpt_gate codec; then
       ( echo "start $(date +%s.%N)"; cdd ts_dec_b$B -- "timeout -k 10 7200 $TR --mode dec --dec real $CTA --b $B --ctx 1 --dec-tokens $CDT --infer-sms 9999 --dump /out/cdc/ts_dec_b$B"; echo "end $(date +%s.%N)" ) > "$OUT/cdc/ts_dec_b$B.times" 2>&1 &
       TSD=$!
       ( echo "start $(date +%s.%N)"; cdd ts_train_b$B -- "timeout -k 10 7200 $TR --mode train --jobs $CDN $CTB --steps $CDS --dump /out/cdc/ts_train_b$B"; echo "end $(date +%s.%N)" ) > "$OUT/cdc/ts_train_b$B.times" 2>&1 &
-      wait $! "$TSD"; dcgm_off
+      TST=$!; TSP=
+      if [ -n "$PFA" ]; then ( echo "start $(date +%s.%N)"; cdd ts_pf_b$B -- "timeout -k 10 7200 $TR --mode pf --dec real $CTA $PFA --dump /out/cdc/ts_pf_b$B"; echo "end $(date +%s.%N)" ) > "$OUT/cdc/ts_pf_b$B.times" 2>&1 & TSP=$!; fi
+      wait $TST "$TSD" $TSP; dcgm_off
     done; fi
   done
 fi

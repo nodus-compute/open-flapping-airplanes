@@ -31,6 +31,7 @@ def main():
     ap.add_argument("--top-layers", type=int, default=1)
     ap.add_argument("--seed", type=int, default=413)
     ap.add_argument("--hidden", type=int, default=2560)
+    ap.add_argument("--prefill-chunks", type=int, default=0, help="also write prefill_tokens.i32: the next K x mb rows of the same trace (after the training rows)")
     ap.add_argument("--lr-cycle", action="store_true", help="jobs past the prefix run's count reuse its learning rates cyclically (own seed-derived adapter init)")
     a = ap.parse_args()
     cfg = {}
@@ -52,15 +53,16 @@ def main():
     rows = []
     with open(a.data / "train.jsonl", "rb") as f:
         for line in f:
-            if len(rows) == a.steps * a.mb:
+            if len(rows) == (a.steps + a.prefill_chunks) * a.mb:
                 break
             row = json.loads(line)
             ids = tok.encode(row["text"], add_special_tokens=False)[: a.seq]
             if len(ids) < 2:
                 raise SystemExit("training row contains fewer than two tokens")
             rows.append((row["id"], ids))
-    if len(rows) < a.steps * a.mb:
-        raise SystemExit(f"only {len(rows)} rows for {a.steps} microbatches")
+    if len(rows) < (a.steps + a.prefill_chunks) * a.mb:
+        raise SystemExit(f"only {len(rows)} rows for {a.steps} microbatches + {a.prefill_chunks} prefill chunks")
+    prow, rows = rows[a.steps * a.mb:], rows[: a.steps * a.mb]
     toks = np.zeros((a.steps * a.mb, a.seq), np.int32)
     labs = np.full((a.steps * a.mb, a.seq), -100, np.int32)
     for i, (_, ids) in enumerate(rows):
@@ -80,6 +82,12 @@ def main():
     np.array(lrs[: a.jobs], np.float32).tofile(a.out / "tail_lr.f32")
     ids = [[r[0] for r in rows[s * a.mb:(s + 1) * a.mb]] for s in range(a.steps)]
     (a.out / "tail_rows.json").write_text(json.dumps(dict(seed=seed, layer=layer, learning_rates=lrs[: a.jobs], row_ids=ids)))
+    if prow:
+        pt = np.zeros((len(prow), a.seq), np.int32)
+        for i, (_, pids) in enumerate(prow):
+            pt[i, : len(pids)] = pids
+        pt.tofile(a.out / "prefill_tokens.i32")
+        (a.out / "prefill_rows.json").write_text(json.dumps(dict(chunks=a.prefill_chunks, rows_per_chunk=a.mb, row_ids=[r[0] for r in prow])))
     print(f"tail_prep: {a.steps} microbatches, {int((labs >= 0).sum())} labels, jobs {a.jobs}, seed {seed}, layer {layer}")
 
 

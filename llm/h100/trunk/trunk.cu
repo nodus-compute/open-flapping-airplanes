@@ -41,7 +41,7 @@ constexpr int SMEM = gemm::smem_bytes();
 static_assert(4 * MAXPOS * 4 <= SMEM, "attention scores fit the GEMM smem");
 
 enum Kind { T_BASEQ, T_BASEV, T_DOWN, T_UPG, T_DB, T_DU, T_DA, T_ADAM, T_LOSS, D_DOWN, D_QKV, D_ATT, D_O, D_HEAD, D_NEXT, T_TUP, T_TDN, T_TCV, T_REMB, T_RRMS, T_RQKN, T_RATT, T_RACT,
-  T_RATTC, T_RQV, T_RCP, T_CE, T_RNB, T_RACTB, T_RADQ, T_RADV, T_GNN, D_REAL, T_RADQC, T_RADVC };
+  T_RATTC, T_RQV, T_RCP, T_CE, T_RNB, T_RACTB, T_RADQ, T_RADV, T_GNN, D_REAL, T_RADQC, T_RADVC, T_PFCP };
 struct Ph { int kind, ntasks, tilesM, reps, layer, f32, koff; gemm::Args ga; float *fx, *fx2; const bf16* w2;
 #ifdef MW_GEMM_WG
   const CUtensorMap* tmB; const CUtensorMap* const* tmAx;   // wgmma/TMA backend: B map + one A map per X slot
@@ -53,6 +53,7 @@ struct Job {
   int* done; unsigned* ticket;
 };
 struct Ctx {
+  const Ctx* pf;   // --prefill-chunks: device copy of the prefill tenant's context (own activations, own queue in pf->tr)
   Job tr, dc; int mode, infer_sms, lend; unsigned* lent; const int* smid_rank; int* finished;
   // train
   int jobs, tk, nx; float scale, lr, b1, b2, eps, inv;
@@ -411,6 +412,11 @@ __device__ void train_task(const Ctx& C, const Ph& d, int local, int step, char*
 #endif
       break;
     }
+    case T_PFCP: {                                             // prefill tenant: final-norm hidden of this chunk -> output slot step
+      const bf16* src = d.ga.A; bf16* dst = (bf16*)d.ga.C + (size_t)step * tk * D; const size_t i0 = (size_t)local * THREADS * 8;
+      for (int i = 0; i < 8; i++) { const size_t k = i0 + (size_t)i * THREADS + tid; dst[k] = src[k]; }
+      break;
+    }
     case T_TCV: {                                              // split-K trunk: fp32 accumulator -> bf16 activations
       const float* src = (const float*)d.ga.A; bf16* dst = (bf16*)d.ga.C; const size_t i0 = (size_t)local * THREADS * 8;
       for (int i = 0; i < 8; i++) { const size_t k = i0 + (size_t)i * THREADS + tid; dst[k] = __float2bfloat16(src[k]); }
@@ -628,12 +634,13 @@ __device__ int try_claim(const Ctx& C, const Job& J, int dec, char* smem) {
   __syncthreads();
   return 1;
 }
-// strict priority on every SM: a ready decode instruction first, a trunk/LoRA tile only when no decode instruction is ready
+// strict priority on every SM: a ready decode instruction first, then a prefill tile (--prefill-chunks), a trunk/LoRA tile only when neither is ready
 __device__ void dyn_loop(const Ctx& C, char* smem) {
   for (;;) {
     const int a = try_claim(C, C.dc, 1, smem); if (a == 1) continue;
+    const int p = !C.pf || (int)blockIdx.x < C.dres ? 2 : try_claim(*C.pf, C.pf->tr, 0, smem); if (p == 1) continue;
     const int b = (int)blockIdx.x < C.dres ? 2 : try_claim(C, C.tr, 0, smem); if (b == 1) continue;
-    if (a == 2 && b == 2) break;
+    if (a == 2 && b == 2 && p == 2) break;
     if (threadIdx.x == 0) __nanosleep(64);
   }
 }
@@ -736,7 +743,7 @@ static void pct(std::vector<double> v, double& p50, double& p99) { if (v.empty()
 int main(int argc, char** argv) {
   std::string mode_s = "co", dir; int jobs = 16, tk = 512, steps = 16, b = 1, ctx0 = 1024, dtok = 2048, infer_sms = 33, nx = 4, lend = 0; u64 seed = 1234;
   int lt = 0, jb = 0; std::string trunk_s = "shared";
-  int nreq = 64, Lr = 64, kc = 0, rseq = 512; std::string ckpt, attn_s = "cuda", tail_s = "mse", tdata, dec_s = "synth", abwd_s = "cuda"; int dres = 0, dlim = 0, dP = 0; double rate = 0, max_s = 0; std::string split_s = "static";
+  int nreq = 64, Lr = 64, kc = 0, rseq = 512; std::string ckpt, attn_s = "cuda", tail_s = "mse", tdata, dec_s = "synth", abwd_s = "cuda"; int dres = 0, dlim = 0, dP = 0, npf = 0; std::string pfdata; double rate = 0, max_s = 0; std::string split_s = "static";
   for (int i = 1; i < argc; i++) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s) && i + 1 < argc; };
     if (is("--mode")) mode_s = argv[++i]; else if (is("--jobs")) jobs = atoi(argv[++i]); else if (is("--tokens")) tk = atoi(argv[++i]);
@@ -746,11 +753,14 @@ int main(int argc, char** argv) {
     else if (is("--req-tokens")) Lr = atoi(argv[++i]); else if (is("--trunk-kchunk")) kc = atoi(argv[++i]); else if (is("--trunk-ckpt")) ckpt = argv[++i]; else if (is("--seq")) rseq = atoi(argv[++i]); else if (is("--max-seconds")) max_s = atof(argv[++i]);
     else if (is("--trunk-layers")) lt = atoi(argv[++i]); else if (is("--trunk")) trunk_s = argv[++i]; else if (is("--job-base")) jb = atoi(argv[++i]);
     else if (is("--attn")) attn_s = argv[++i]; else if (is("--dec")) dec_s = argv[++i]; else if (is("--attn-bwd")) abwd_s = argv[++i]; else if (is("--dec-reserve")) dres = atoi(argv[++i]); else if (is("--tail")) tail_s = argv[++i]; else if (is("--tail-data")) tdata = argv[++i];
+    else if (is("--prefill-chunks")) npf = atoi(argv[++i]); else if (is("--prefill-data")) pfdata = argv[++i];
     else if (!strcmp(argv[i], "--lend")) lend = 1; else if (is("--seed")) seed = atoll(argv[++i]); else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
   }
   if (rate > 0) dtok = nreq * Lr;
-  const int mode = mode_s == "train" ? 0 : mode_s == "dec" ? 1 : mode_s == "co" ? 2 : -1;
+  const int mode = mode_s == "train" ? 0 : mode_s == "dec" ? 1 : mode_s == "co" ? 2 : mode_s == "pf" ? 4 : -1;
   const bool treal = tail_s == "real", atc = attn_s == "tc", dreal = dec_s == "real", atcb = abwd_s == "tc";
+  if (npf < 0 || (mode == 4 && npf < 1) || (npf && (ckpt.empty() || pfdata.empty() || (mode != 4 && (mode != 2 || split_s != "dynamic"))))) {
+    fprintf(stderr, "bad --prefill-chunks/--prefill-data: needs --trunk-ckpt, and --mode pf or --mode co --sm-split dynamic\n"); return 2; }
   if (abwd_s != "cuda" && !atcb) { fprintf(stderr, "bad --attn-bwd cuda|tc\n"); return 2; }
   if ((dec_s != "synth" && !dreal) || (dreal && (ckpt.empty() || rate > 0)) || dres < 0 || (dres && (mode != 2 || split_s != "dynamic"))) {
     fprintf(stderr, "bad --dec synth|real (real needs --trunk-ckpt, no --rate) / --dec-reserve (co + dynamic split only)\n"); return 2; }
@@ -776,7 +786,7 @@ int main(int argc, char** argv) {
   printf("GPU %s, %d SMs, %d blocks (%d/SM); mode %s; train jobs %d x %d tokens, q/v rank %d, %d steps; decode b=%d ctx %d, %d tokens, infer SMs %d\n",
          prop.name, nsm, nblocks, occ, mode_s.c_str(), jobs, tk, R, steps, b, ctx0, dtok, mode == 0 ? 0 : infer_sms);
 
-  Ctx C; memset(&C, 0, sizeof C); C.mode = mode == 2 && split_s == "dynamic" ? 3 : mode; C.infer_sms = infer_sms; C.lend = mode == 2 && lend; C.lent = dalloc<unsigned>(1); C.smid_rank = d_rank; C.finished = dalloc<int>(1);
+  Ctx C; memset(&C, 0, sizeof C); C.mode = (mode == 2 && split_s == "dynamic") || mode == 4 ? 3 : mode; C.infer_sms = infer_sms; C.lend = mode == 2 && lend; C.lent = dalloc<unsigned>(1); C.smid_rank = d_rank; C.finished = dalloc<int>(1);
   if (dres >= nblocks) { fprintf(stderr, "--dec-reserve must be < %d blocks\n", nblocks); return 2; }
   C.dres = dres; C.t0 = dalloc<u64>(1); C.max_ns = (u64)(max_s * 1e9); C.tmax = dalloc<u64>(64); C.L = rate > 0 ? Lr : 0;
   if (rate > 0) { std::vector<u64> arr(nreq); std::mt19937_64 g(seed * 7 + 11); std::exponential_distribution<double> ex(rate); double t = 0.02;
@@ -794,14 +804,14 @@ int main(int argc, char** argv) {
   C.Yq = dalloc<bf16>((size_t)tk * NQ); C.Yv = dalloc<bf16>((size_t)tk * NKV);
   static_assert(TI == 9728, "Qwen3-4B MLP width");
   // --trunk-ckpt DIR (h100/mm_prep.py layout): real Qwen3-4B layers [0, lt) as the frozen trunk; the tail's base q/v = layer lt's real q/v
-  size_t lst = 0; const bf16* RW = nullptr;
+  size_t lst = 0; const bf16* RW = nullptr; int LmA = 0, VA = 0;
   if (!ckpt.empty()) {
     FILE* f = fopen((ckpt + "/meta.txt").c_str(), "r"); int H, Lm, NH, NKVm, I, V, P; float eps, theta;
     if (!f || fscanf(f, "%d %d %d %d %d %d %d %f %f", &H, &Lm, &NH, &NKVm, &I, &V, &P, &eps, &theta) != 9) { fprintf(stderr, "cannot read %s/meta.txt\n", ckpt.c_str()); return 2; }
     fclose(f);
     if (H != D || NH * HD != NQ || NKVm * HD != NKV || I != TI || lt >= Lm) { fprintf(stderr, "checkpoint shape mismatch (need Qwen3-4B, trunk-layers < %d)\n", Lm); return 2; }
     lst = (size_t)D + (size_t)NQKV * D + 2 * HD + (size_t)D * NQ + D + (size_t)2 * TI * D + (size_t)D * TI;
-    const size_t total = (size_t)V * D + D + (size_t)(dreal ? Lm : lt + 1) * lst; bf16* w = dalloc<bf16>(total);
+    const size_t total = (size_t)V * D + D + (size_t)(dreal || npf ? Lm : lt + 1) * lst; bf16* w = dalloc<bf16>(total);
     FILE* wf = fopen((ckpt + "/weights.bf16").c_str(), "rb"); if (!wf) { fprintf(stderr, "cannot open %s/weights.bf16\n", ckpt.c_str()); return 2; }
     std::vector<bf16> buf(1 << 26); size_t off = 0;
     while (off < total) { const size_t n = std::min(buf.size(), total - off); if (fread(buf.data(), 2, n, wf) != n) { fprintf(stderr, "short weights file\n"); return 2; }
@@ -811,7 +821,7 @@ int main(int argc, char** argv) {
     if (!tf || fread(tok.data(), 4, tok.size(), tf) != tok.size()) { fprintf(stderr, "cannot read %zu tokens from %s/train_tokens.i32\n", tok.size(), ckpt.c_str()); return 2; }
     fclose(tf); for (int t : tok) if (t < 0 || t >= V) { fprintf(stderr, "token id out of range\n"); return 2; }
     int* dt = dalloc<int>(tok.size()); CK(cudaMemcpy(dt, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice));
-    C.Remb = w; RW = w + (size_t)V * D + D; C.rtok = dt; C.rseq = rseq; C.rms_eps = eps; C.rtheta = theta;
+    C.Remb = w; RW = w + (size_t)V * D + D; LmA = Lm; VA = V; C.rtok = dt; C.rseq = rseq; C.rms_eps = eps; C.rtheta = theta;
     C.rh = dalloc<float>((size_t)tk * D); C.rxn = dalloc<bf16>((size_t)tk * D); C.rqkv = dalloc<bf16>((size_t)tk * NQKV);
     C.ratt = dalloc<bf16>((size_t)tk * NQ); C.rgu = dalloc<bf16>((size_t)tk * 2 * TI); C.ract = dalloc<bf16>((size_t)tk * TI);
     C.Wq = RW + (size_t)lt * lst + D; C.Wv = C.Wq + (size_t)(NQ + NKV) * D;
@@ -1001,7 +1011,7 @@ int main(int argc, char** argv) {
   if ((int)Bt.ph.size() != LOSS + 1) { fprintf(stderr, "tail phase count mismatch\n"); return 2; }
   printf("tail %s, attn %s, attn-bwd %s\n", tail_s.c_str(), attn_s.c_str(), abwd_s.c_str());
   printf("trunk: %d frozen layers (%s, k-chunk %d), job-base %d, sm-split %s, kernel launches 1 for %d steps\n", lt, trunk_s.c_str(), kc, jb, split_s.c_str(), steps);
-  upload(Bt, mode == 1 ? 0 : steps, ADAM, C.tr);
+  upload(Bt, mode == 1 || mode == 4 ? 0 : steps, ADAM, C.tr);
   // decode graph (per token)
   Builder Bd;
   Bd.add(mk(D_DOWN, 1), {make_int2(5, -1)}); Bd.add(mk(D_QKV, NQKV / 128), {make_int2(0, 0)}); Bd.add(mk(D_ATT, b * NKVH), {make_int2(1, 0)});
@@ -1013,9 +1023,49 @@ int main(int argc, char** argv) {
       add(mmd::K_NORM, b, l, 1); add(mmd::K_GU, 2 * TI / 128, l, 0); add(mmd::K_DN, D / 128, l, 0); }
     add(mmd::K_NORM, b, 0, 2); add(mmd::K_HEAD, VOC / 128, 0, 0); add(mmd::K_NEXT, 1, 0, 0);
     Bd.deps[Bd.dep_off[0]] = make_int2(pv, -1);   // layer-0 norm waits for the previous token's argmax
-    upload(Bd, mode == 0 ? 0 : dlim, pv, C.dc); C.tok_done = C.RM.tok_done; dtok = dlim;
-  } else upload(Bd, mode == 0 ? 0 : dtok, 5, C.dc);
+    upload(Bd, mode == 0 || mode == 4 ? 0 : dlim, pv, C.dc); C.tok_done = C.RM.tok_done; dtok = dlim;
+  } else upload(Bd, mode == 0 || mode == 4 ? 0 : dtok, 5, C.dc);
   printf("train: %d phases, %d tasks/step; decode: 6 phases, %d tasks/token\n", (int)Bt.ph.size(), C.tr.tps, C.dc.tps);
+  Ctx Pc = C; bf16* pf_out = nullptr; int pf_last = -1;
+  if (npf) {   // prefill tenant: chunks of tk tokens (rseq segments) through all real layers + final norm; own activations and queue, chunks in order
+    if (VA != VOC) { fprintf(stderr, "--prefill-chunks: need vocab %d\n", VOC); return 2; }
+    std::vector<int> pt((size_t)npf * tk); FILE* pfp = fopen(pfdata.c_str(), "rb");
+    if (!pfp || fread(pt.data(), 4, pt.size(), pfp) != pt.size()) { fprintf(stderr, "cannot read %zu tokens from %s\n", pt.size(), pfdata.c_str()); return 2; }
+    fclose(pfp); for (int t : pt) if (t < 0 || t >= VOC) { fprintf(stderr, "prefill token id out of range\n"); return 2; }
+    int* dpt = dalloc<int>(pt.size()); CK(cudaMemcpy(dpt, pt.data(), pt.size() * 4, cudaMemcpyHostToDevice));
+    Pc.pf = nullptr; Pc.rtok = dpt; Pc.nx = npf; Pc.step_done = dalloc<u64>(npf); Pc.finished = dalloc<int>(1);
+    Pc.rh = dalloc<float>((size_t)tk * D); Pc.rxn = dalloc<bf16>((size_t)tk * D); Pc.rqkv = dalloc<bf16>((size_t)tk * NQKV);
+    Pc.ratt = dalloc<bf16>((size_t)tk * NQ); Pc.rgu = dalloc<bf16>((size_t)tk * 2 * TI); Pc.ract = dalloc<bf16>((size_t)tk * TI);
+    bf16* pfn = dalloc<bf16>((size_t)tk * D); pf_out = dalloc<bf16>((size_t)npf * tk * D);
+    Builder Bp;
+    auto pdep = [&](Ph t) { pf_last = Bp.add(t, {pf_last < 0 ? make_int2(0, -1) : make_int2(pf_last, 0)}); };
+    auto pew = [&](int kind, int nt, const bf16* Bw, void* Cp) { Ph t = mk(kind, nt); t.reps = 1; t.ga.B = Bw; t.ga.C = Cp; pdep(t); };
+    auto pgm = [&](const bf16* A, const bf16* Bw, void* Cp, int n, int k, int f32) {
+      Ph t = mk(T_TDN, 0); t.layer = 1; t.reps = 1; t.f32 = f32; t.koff = 0;
+      t.ga.A = A; t.ga.B = Bw; t.ga.C = Cp; t.ga.accumulate = f32; t.ga.lda = k; t.ga.ldb = k; t.ga.ldc = n; t.ga.ldaux = 8; t.ga.M = tk; t.ga.N = n; t.ga.K = k;
+      t.tilesM = tk / 128; t.ntasks = (tk / 128) * (n / 128);
+      if (!gemm::args_ok(t.ga)) { fprintf(stderr, "bad prefill GEMM args\n"); exit(2); }
+#ifdef MW_GEMM_WG
+      { const CUtensorMap* m0 = gemm::sm90::make_map(A, k, tk, k, 64, 128); const CUtensorMap** dm; CK(cudaMalloc(&dm, sizeof(void*)));
+        CK(cudaMemcpy(dm, &m0, sizeof(void*), cudaMemcpyHostToDevice)); t.tmAx = dm; t.tmB = gemm::sm90::make_map(Bw, k, n, k, 64, 128); }
+#endif
+      pdep(t); };
+    pew(T_REMB, tk * D / (THREADS * 8), nullptr, nullptr);
+    for (int l = 0; l < LmA; l++) {
+      const bf16* W = RW + (size_t)l * lst; const bf16* Wn = W + D + (size_t)NQKV * D; const bf16* Wo = Wn + 2 * HD; const bf16* Wp = Wo + (size_t)D * NQ;
+      const bf16* Wgu = Wp + D; const bf16* Wd = Wgu + (size_t)2 * TI * D;
+      pew(T_RRMS, tk / 8, W, Pc.rxn); pgm(Pc.rxn, W + D, Pc.rqkv, NQKV, D, 0); pew(T_RQKN, tk * 40 / 8, Wn, nullptr);
+      if (atc) pew(T_RATTC, tk / 4, nullptr, nullptr); else pew(T_RATT, tk * 32 / 8, nullptr, nullptr);
+      pgm(Pc.ratt, Wo, Pc.rh, D, NQ, 1); pew(T_RRMS, tk / 8, Wp, Pc.rxn); pgm(Pc.rxn, Wgu, Pc.rgu, 2 * TI, D, 0);
+      pew(T_RACT, tk * TI / (THREADS * 8), nullptr, nullptr); pgm(Pc.ract, Wd, Pc.rh, D, TI, 1);
+    }
+    pew(T_RRMS, tk / 8, C.Remb + (size_t)VOC * D, pfn);   // final norm
+    { Ph t = mk(T_PFCP, tk * D / (THREADS * 8)); t.reps = 1; t.ga.A = pfn; t.ga.C = pf_out; pdep(t); }
+    Bp.deps[Bp.dep_off[0]] = make_int2(pf_last, -1);   // chunk c+1 starts after chunk c's output copy (one activation set)
+    upload(Bp, npf, pf_last, Pc.tr);
+    Ctx* dpc; CK(cudaMalloc(&dpc, sizeof(Ctx))); CK(cudaMemcpy(dpc, &Pc, sizeof(Ctx), cudaMemcpyHostToDevice)); C.pf = dpc;
+    printf("prefill: %d chunks x %d tokens (seq %d), %d layers + final norm, %d phases, %d tasks/chunk\n", npf, tk, rseq, LmA, (int)Bp.ph.size(), Pc.tr.tps);
+  }
   { size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot)); printf("device memory used %.1f of %.1f GB\n", (tot - fr) / 1e9, tot / 1e9); }
 
   cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
@@ -1023,7 +1073,7 @@ int main(int argc, char** argv) {
   float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); unsigned lent = 0; CK(cudaMemcpy(&lent, C.lent, 4, cudaMemcpyDeviceToHost)); printf("kernel %.3f s, lending %s, lent train tasks %u\n", ms / 1e3, C.lend ? "on" : "off", lent);
 
   u64 tr_lo = 0, tr_hi = 0;
-  if (mode != 1) {
+  if (mode != 1 && mode != 4) {
     std::vector<u64> sd(steps); CK(cudaMemcpy(sd.data(), C.step_done, steps * 8, cudaMemcpyDeviceToHost));
     std::vector<float> loss((size_t)steps * jobs); CK(cudaMemcpy(loss.data(), C.loss, loss.size() * 4, cudaMemcpyDeviceToHost));
     int sdone = 0; while (sdone < steps && sd[sdone]) sdone++;   // early stop: --max-seconds or last decode request done
@@ -1033,7 +1083,15 @@ int main(int argc, char** argv) {
     if (n > 0) printf("train: steady %.4f ms/step -> %.2f steps/s (%d jobs x %d tokens: %.0f job-tok/s)\n", span * 1e3 / n, n / span, jobs, tk, (double)n * jobs * tk / span);
     dump(dir, "loss.f32", C.loss, (size_t)steps * jobs); dump(dir, "step_done.u64", C.step_done, (size_t)steps); dump(dir, "P.f32", C.P, (size_t)jobs * PJ); dump(dir, "G.f32", C.G, (size_t)jobs * PJ); dump(dir, "tmax.u64", C.tmax, 64); if (!ckpt.empty()) dump(dir, "Xt.bf16", C.Xt[lt % 2], (size_t)tk * D);
   }
-  if (mode != 0) {
+  if (npf) {
+    std::vector<u64> pd(npf); u64 k0 = 0; CK(cudaMemcpy(pd.data(), Pc.step_done, npf * 8, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(&k0, C.t0, 8, cudaMemcpyDeviceToHost));
+    int pdn = 0; while (pdn < npf && pd[pdn]) pdn++;
+    std::vector<double> ct; for (int c = 0; c < pdn; c++) ct.push_back((pd[c] - (c ? pd[c - 1] : k0)) * 1e-6);
+    double c50, c99; pct(ct, c50, c99); const double sp = pdn ? (pd[pdn - 1] - k0) * 1e-9 : 0;
+    printf("prefill: %d of %d chunks done in %.3f s -> %.1f tok/s, chunk p50 %.3f ms p99 %.3f ms\n", pdn, npf, sp, pdn * (double)tk / (sp + 1e-12), c50, c99);
+    dump(dir, "pf_out.bf16", pf_out, (size_t)pdn * tk * D); dump(dir, "pf_done.u64", Pc.step_done, (size_t)pdn);
+  }
+  if (mode != 0 && mode != 4) {
     std::vector<u64> td(dtok); CK(cudaMemcpy(td.data(), C.tok_done, dtok * 8, cudaMemcpyDeviceToHost));
     int done = 0; while (done < dtok && td[done]) done++;
     std::vector<double> lat; int inwin = 0; u64 lo = 0, hi = 0;

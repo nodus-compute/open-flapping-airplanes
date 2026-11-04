@@ -8,6 +8,8 @@ solo/train-alone/solo16 references; decode solo is shared). Declared tc-vs-cuda 
 (one decode, one shared-trunk training), and the same with training counted against the per-job dedicated arm (N x steps / solo).
 Stock baseline (ts_dec_b*/ts_train_b*): the same decode and N-job training as 2 processes time-sliced on one GPU (no MPS), gated the same
 way (token ids, solo16 losses bitwise, DCGM); host start/end give the overlap fraction (any non-overlap time favours the baseline).
+CODEC_PREFILL=1 (pf solo, prefill in every co arm, ts_pf_b* third process): prefill outputs (final-norm hidden, pf_out.bf16) byte-equal to
+pf solo, f_prefill = co prefill tok/s / solo, U adds f_prefill, and the dedicated baseline is 3 GPUs.
 Per b: work per paid GPU-hour as job steps + decode tokens, and U for co (1 GPU), ts (1 GPU) and 2 dedicated GPUs (U = 2 over 2 GPU-h).
 """
 
@@ -20,12 +22,30 @@ from pathlib import Path
 from trunk_ckpt_score import log, rate, raw
 
 PRE = "cdc"
+PFR = re.compile(r"prefill: (\d+) of (\d+) chunks done in ([\d.]+) s -> ([\d.]+) tok/s, chunk p50 ([\d.]+) ms p99 ([\d.]+) ms")
 DEC = re.compile(r"-> ([\d.]+) tok/s, tpot p50 ([\d.]+) ms p99 ([\d.]+) ms")
 
 
 def dec(text):
     m = DEC.search(text or "")
     return dict(tok_s=float(m.group(1)), p50_ms=float(m.group(2)), p99_ms=float(m.group(3))) if m else None
+
+
+def pfr(text):
+    m = PFR.search(text or "")
+    return dict(chunks=int(m.group(1)), of=int(m.group(2)), secs=float(m.group(3)), tok_s=float(m.group(4)), p50_ms=float(m.group(5)), p99_ms=float(m.group(6))) if m else None
+
+
+def prefill(out, run, gates, key):
+    """(f_prefill, row fields) for a run with the prefill tenant vs pf solo; (0.0, {}) when CODEC_PREFILL was off."""
+    solo = pfr(log(out, "pf", PRE))
+    if solo is None:
+        return 0.0, {}
+    r = pfr(log(out, run, PRE))
+    ok = bool(raw(out, run, "pf_out.bf16", PRE)) and raw(out, run, "pf_out.bf16", PRE) == raw(out, "pf", "pf_out.bf16", PRE) and bool(r) and r["chunks"] == r["of"]
+    gates[key] = gates.get(key, True) and ok
+    f = r["tok_s"] / solo["tok_s"] if r and solo["tok_s"] else None
+    return f, dict(prefill_solo=solo, prefill=r, f_prefill=f, prefill_bitwise=ok, prefill_tokens_per_paid_gpu_hour=3600 * r["tok_s"] if r else None)
 
 
 def u64s(out, run, name):
@@ -63,14 +83,17 @@ def ts_rows(out, d, solos, t_alone, errors, gates):
         ds, dt, tt = dec(log(out, f"dec_b{b}", PRE)), dec(log(out, p.name, PRE)), rate(log(out, tn, PRE))
         tok_ok = bool(raw(out, p.name, "toks.i32", PRE)) and raw(out, p.name, "toks.i32", PRE) == raw(out, f"dec_b{b}", "toks.i32", PRE)
         tr_ok = losses_ok(out, tn, solos, "")
-        a, c = times(d, p.name), times(d, tn)
-        ov = (min(a[1], c[1]) - max(a[0], c[0])) / max(a[1] - a[0], c[1] - c[0]) if a and c else None
+        fp, pfx = prefill(out, f"ts_pf_b{b}", gates, "ts_prefill_bitwise")
+        tw = [times(d, p.name), times(d, tn)] + ([times(d, f"ts_pf_b{b}")] if pfx else [])
+        ov = (min(t[1] for t in tw) - max(t[0] for t in tw)) / max(t[1] - t[0] for t in tw) if all(tw) else None
         if not (ds and dt and tt and ov is not None):
             errors.append(f"ts_b{b}: missing decode/train rate or host times")
         fd = dt["tok_s"] / ds["tok_s"] if ds and dt and ds["tok_s"] else None
         ft = tt / t_alone if tt and t_alone else None
-        rows.append(dict(arm=f"ts_b{b}", b=b, decode_ts=dt, train_steps_s=tt, f_decode=fd, f_train=ft, overlap_frac=ov,
-                         gain_vs_2_dedicated_gpus=fd + ft if fd is not None and ft is not None else None,
+        if fp is None:
+            fd = None
+        rows.append(dict(arm=f"ts_b{b}", b=b, decode_ts=dt, train_steps_s=tt, f_decode=fd, f_train=ft, overlap_frac=ov, **pfx,
+                         gain_vs_2_dedicated_gpus=fd + ft + fp if fd is not None and ft is not None else None,
                          decode_tokens_per_paid_gpu_hour=3600 * dt["tok_s"] if dt else None,
                          train_useful_steps_per_paid_gpu_hour=3600 * n * tt if tt else None, decode_bitwise=tok_ok, train_bitwise=tr_ok))
         gates["ts_decode_bitwise"] &= tok_ok
@@ -104,12 +127,15 @@ def score_arm(out, d, sx, tpot_ratio, errors, gates):
         fd = dc["tok_s"] / ds["tok_s"] if ds and dc and ds["tok_s"] else None
         ft = tc / t_alone if tc and t_alone else None
         fj = n * tc / t_solo if tc and t_solo and n else None
+        fp, pfx = prefill(out, p.name, gates, "prefill_bitwise")
+        if fd is not None and fp is None:
+            fd = None
         rows.append(dict(arm=p.name, b=b, reserve=rs, decode_solo=ds, decode_co=dc, train_steps_s=tc, f_decode=fd, f_train=ft,
-                         gain_vs_2_dedicated_gpus=fd + ft if fd is not None and ft is not None else None,
-                         gain_vs_dedicated_decode_plus_perjob_train=fd + fj if fd is not None and fj is not None else None,
+                         gain_vs_2_dedicated_gpus=fd + ft + fp if fd is not None and ft is not None else None,
+                         gain_vs_dedicated_decode_plus_perjob_train=fd + fj + fp if fd is not None and fj is not None else None,
                          decode_tokens_per_paid_gpu_hour=3600 * dc["tok_s"] if dc else None,
                          train_useful_steps_per_paid_gpu_hour=3600 * n * tc if tc else None,
-                         decode_bitwise=tok_ok, train_bitwise=tr_ok, tpot_ok=tp_ok, rates_overlap=overlap))
+                         decode_bitwise=tok_ok, train_bitwise=tr_ok, tpot_ok=tp_ok, rates_overlap=overlap, **pfx))
         gates["decode_bitwise"] &= tok_ok
         gates["train_bitwise"] &= tr_ok
         gates["tpot_p99"] &= tp_ok
@@ -166,6 +192,10 @@ def main():
                                                      decode_tokens=best["decode_tokens_per_paid_gpu_hour"]),
                             "time_slice_1gpu": dict(U=t["gain_vs_2_dedicated_gpus"], job_steps=t["train_useful_steps_per_paid_gpu_hour"],
                                                     decode_tokens=t["decode_tokens_per_paid_gpu_hour"]),
+                            "prefill_tokens": dict(co_1gpu=best and best.get("prefill_tokens_per_paid_gpu_hour"),
+                                                   time_slice_1gpu=t.get("prefill_tokens_per_paid_gpu_hour"),
+                                                   dedicated=t["prefill_solo"]["tok_s"] * 3600 / 3 if t.get("prefill_solo") else None),
+                            "dedicated_gpus": 3 if t.get("prefill_solo") else 2,
                             "dedicated_2gpu": dict(U=1.0, job_steps=1800 * groups["cuda"]["jobs"] * groups["cuda"]["train_alone_steps_s"]
                                                    if groups["cuda"]["train_alone_steps_s"] else None,
                                                    decode_tokens=1800 * t["decode_ts"]["tok_s"] / t["f_decode"] if t["decode_ts"] and t["f_decode"] else None)},
