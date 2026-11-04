@@ -1,13 +1,13 @@
 """Independent stdlib verifier for the Moeslim H100 PCIe tilecap sweep:
-python3 h100/tilecap_pcie_verify.py --base R16:S1:DIR --bundle R:S:DIR [--bundle ...] -> JSON on stdout; exit 0 only if every gate passes.
+python3 h100/tilecap_pcie_verify.py --base R16:S1:DIR --bundle R:S:DIR [--bundle ...] [--gpu-name NAME --hardware-class LABEL] -> JSON on stdout; exit 0 only if every gate passes.
 
 Shares no code with codec_score / codec_verify / f_split and reads no summary JSON: raw artifacts only.
-Per bundle: preflight.json passed, nvidia-smi name exactly 'NVIDIA H100 PCIe', driver >= 580, MATMUL_OK; every cdc_<run>.wall rc 0;
+Per bundle: preflight.json passed, nvidia-smi name exactly --gpu-name (default 'NVIDIA H100 PCIe'), driver >= 580, MATMUL_OK; every cdc_<run>.wall rc 0;
 32 solo16_j refs; for each co_b<b>_r<r> arm and the ts_b<b> time-slice pair: decode ids bitwise vs dec_b<b> solo, per-job first-16 losses
 bitwise vs solo16_j<j>, all losses finite, p99 TPOT <= 1.10x solo, decode outlasts training (co), one kernel launch (co), >= 50% 100 ms DCGM
 coverage; f_decode, f_train, U over billed wall time; worst tile from tmax.u64 (report). No fatal CUDA/Python text in any cdc log.
 Against BASE (same box, flag defaults = the 9873b79 config): S == 1 bundles must match every common run byte for byte (gate);
-S > 1 bundles report it only (split-K changes the fp32 summation order). Hardware class H100 PCIe (moeslim): never pooled with SXM5.
+S > 1 bundles report it only (split-K changes the fp32 summation order). Each --hardware-class is its own class, never pooled with another.
 """
 
 import argparse
@@ -49,7 +49,7 @@ def spec(s):
     return int(r.lstrip("R")), int(k.lstrip("S")), Path(d)
 
 
-def verify(out, jobs, batches, tpot_ratio):
+def verify(out, jobs, batches, tpot_ratio, gpu=GPU):
     fail, d = [], out / PRE
 
     def need(k, ok, detail=None):
@@ -65,7 +65,7 @@ def verify(out, jobs, batches, tpot_ratio):
     g = ck.get("gpu_name", {})
     f = [x.strip() for x in str(g.get("detail", "")).strip().split(",")]
     need("preflight_passed", bool(pf and pf.get("passed")))
-    need("gpu_name_exact", bool(g.get("ok")) and f[0] == GPU, g.get("detail"))
+    need("gpu_name_exact", bool(g.get("ok")) and f[0] == gpu, g.get("detail"))
     dm = f[1].split(".")[0] if len(f) >= 2 else ""
     need("driver_ge_580", dm.isdigit() and int(dm) >= 580, f[1:2])
     need("matmul_ok", "MATMUL_OK" in str(ck.get("container_cuda_matmul_nvcc", {}).get("detail", "")))
@@ -176,22 +176,24 @@ def main():
     ap.add_argument("--jobs", type=int, default=32)
     ap.add_argument("--batches", default="1,8")
     ap.add_argument("--tpot-ratio", type=float, default=1.10)
+    ap.add_argument("--gpu-name", default=GPU, help="exact nvidia-smi name")
+    ap.add_argument("--hardware-class", default="H100 PCIe (moeslim)")
     a = ap.parse_args()
     bs = [int(x) for x in a.batches.split(",")]
     br, bk, bd = spec(a.base)
-    base = verify(bd, a.jobs, bs, a.tpot_ratio)
+    base = verify(bd, a.jobs, bs, a.tpot_ratio, a.gpu_name)
     fail = [] if base["passed"] and (br, bk) == (16, 1) else [f"base R{br}/S{bk}"]
     out = []
     for s in a.bundle:
         r, k, p = spec(s)
-        v = verify(p, a.jobs, bs, a.tpot_ratio)
+        v = verify(p, a.jobs, bs, a.tpot_ratio, a.gpu_name)
         ab = same_bytes(bd, p)
         ab["role"] = "gate" if k == 1 else "report-only (split-K fp32 order)"
         v.update(ce_rows_per_task=r, gnn_voc_ksplit=k, vs_base=ab)
         if not v["passed"] or (k == 1 and not ab["identical"]):
             fail.append(f"R{r}/S{k}")
         out.append(v)
-    res = dict(hardware_class="H100 PCIe (moeslim); never pooled with SXM5", gpu_name=GPU, base=dict(base, ce_rows_per_task=br, gnn_voc_ksplit=bk),
+    res = dict(hardware_class=a.hardware_class + "; never pooled with another class", gpu_name=a.gpu_name, base=dict(base, ce_rows_per_task=br, gnn_voc_ksplit=bk),
                bundles=out, passed=not fail, failed=fail)
     print(json.dumps(res, indent=1))
     sys.exit(0 if not fail else 1)
