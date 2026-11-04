@@ -315,7 +315,7 @@ TCKS=${TRUNK_CKPT_SUMMARY:-$ROOT/h100/results/trunk_ckpt/trunk_ckpt_summary.json
 ckpt_gate() { [ "${FORCE_UNGATED:-0}" = 1 ] && return 0
   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["gates"]["hf_cut_hidden"] else 1)' "$TCKS" 2>/dev/null \
     || { echo "SKIP $1: $TCKS missing or hf_cut_hidden gate failed"; return 1; }; }
-TCB="--trunk-ckpt $TCK --trunk-layers $TCL --tokens $TCT --seq 512"
+TCB="--trunk-ckpt $TCK --trunk-layers $TCL --tokens $TCT --seq 512 ${CE_ROWS:+--ce-rows-per-task $CE_ROWS} ${GNN_KSPLIT:+--gnn-voc-ksplit $GNN_KSPLIT}"
 TCPREP="$MM_PIP && python h100/mm_prep.py --repo Qwen/Qwen3-4B --revision $MM_REV1 --out $TCK && python h100/trunk_prep.py --repo Qwen/Qwen3-4B --revision $MM_REV1 --model-dir $TCK --tokens $((4 * TCT))"
 # real top-layer tail (--tail real): layer-35 fwd/bwd + tied lm_head + CE on training_prefix rows; first 16 losses vs PREFIX_RUN dedicated arms (1e-3 rel)
 TTN=${TAIL_JOBS:-8 16 32}; TTS=${TAIL_STEPS:-50}

@@ -1,4 +1,5 @@
-"""Read-only A/B scorer for two codec bundles: python3 h100/ab_verify.py BASE NEW -> JSON on stdout; writes nothing.
+"""Read-only A/B scorer for two codec bundles: python3 h100/ab_verify.py [--common-arms] BASE NEW -> JSON on stdout; writes nothing.
+--common-arms: compare only the BASE dumps whose arm directory exists in NEW (e.g. a different --dec-reserve sweep).
 
 Exit 0 only if (1) h100/codec_verify.py passes on NEW and on BASE (real H100 evidence, every in-bundle gate, rates from raw counts and
 billed wall seconds) and (2) every loss.f32 / P.f32 / toks.i32 / pf_out.bf16 dump under BASE/cdc/<arm>/ is byte-equal in NEW
@@ -27,16 +28,19 @@ def ratio(a, b):
 
 
 def main():
-    if len(sys.argv) != 3:
-        sys.exit("usage: ab_verify.py BASE NEW")
-    base, new = Path(sys.argv[1]), Path(sys.argv[2])
+    args = sys.argv[1:]
+    common = "--common-arms" in args
+    args = [a for a in args if a != "--common-arms"]
+    if len(args) != 2:
+        sys.exit("usage: ab_verify.py [--common-arms] BASE NEW")
+    base, new = Path(args[0]), Path(args[1])
     (rb, jb), (rn, jn) = verify(base), verify(new)
     fail = []
     if rb != 0:
         fail.append(f"base codec_verify rc={rb}: {(jb or {}).get('failed', [])[:6]}")
     if rn != 0:
         fail.append(f"new codec_verify rc={rn}: {(jn or {}).get('failed', [])[:6]}")
-    files = sorted(str(p.relative_to(base)) for p in (base / "cdc").glob("*/*") if p.name in NAMES) if (base / "cdc").is_dir() else []
+    files = sorted(str(p.relative_to(base)) for p in (base / "cdc").glob("*/*") if p.name in NAMES and (not common or (new / "cdc" / p.parent.name).is_dir())) if (base / "cdc").is_dir() else []
     if not files:
         fail.append("no dumps under BASE/cdc")
     diff = [f for f in files if not (new / f).is_file() or (new / f).read_bytes() != (base / f).read_bytes()]
