@@ -212,6 +212,17 @@ int main(int argc, char** argv) {
   CB(cublasCreate(&g_cb));
   int nsm; CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0));
   auto cases = cfgM ? make_cases(4096, 1024, 4096, 100352) : make_cases(4096, 768, 3072, 100352);
+  if (getenv("GEMM_CASES") && !strcmp(getenv("GEMM_CASES"), "h100mm")) {   // Qwen3 decode (M = batch padded to the 128 tile) + trunk tiles
+    cases.clear();
+    const int Hs[2] = {1024, 2560}, Qs[2] = {4096, 6144}, Os[2] = {2048, 4096}, Is[2] = {3072, 9728}; const char* nm[2] = {"q0p6b", "q4b"};
+    const int Ms[4] = {128, 128, 128, 2048}; const char* mt[4] = {"b1", "b8", "b32", "trunk2048"};
+    for (int m = 0; m < 2; m++) for (int b = 0; b < 4; b++) {
+      const std::string t = std::string(nm[m]) + "_" + mt[b] + "_";
+      cases.push_back({t + "qkv", NT, EPI_F32, Ms[b], Qs[m], Hs[m], false}); cases.push_back({t + "o", NT, EPI_F32, Ms[b], Hs[m], Os[m], false});
+      cases.push_back({t + "gu", NT, EPI_F32, Ms[b], 2 * Is[m], Hs[m], false}); cases.push_back({t + "down", NT, EPI_F32, Ms[b], Hs[m], Is[m], false});
+      cases.push_back({t + "head", NT, EPI_F32, Ms[b], 151936, Hs[m], false});
+    }
+  }
   printf("config %s, %d SMs, smem/tile %d B\n", cfgM ? "M (d=1024,h=4096)" : "S (d=768,h=3072)", nsm, tg::smem_bytes());
   int nfail = 0;
   printf("%-22s %-18s | %-9s %-9s %-9s | %-6s %-5s | %8s %8s %6s\n", "case", "M x N x K", "relmax", "relmean", "cublas_rm", "persist", "alias", "ours", "cublas", "ratio");
@@ -302,6 +313,13 @@ int main(int argc, char** argv) {
     char shape[64]; snprintf(shape, 64, "%dx%dx%d", M, N, K);
     printf("%-22s %-18s | %-9.2e %-9.2e %-9.2e | %-6s %-5s | %6.1fTF %6.1fTF %5.2f  %s cfg%d\n", cs.name.c_str(), shape, s.rmax, s.rmean, sc.rmax,
            pers.c_str(), alias.c_str(), bench ? fl / tours * 1e-9 : 0.0, bench ? fl / tcb * 1e-9 : 0.0, bench ? tcb / tours : 0.0, ok ? "PASS" : "FAIL", wide * 10 + nsub);
+    if (const char* jp = getenv("GEMM_JSON")) { FILE* jf = fopen(jp, "a"); if (jf) {
+      const double by = 2.0 * ((double)M * K + (double)K * N) + (double)M * N * (cbf ? 2 : 4);
+      fprintf(jf, "{\"case\": \"%s\", \"backend\": %d, \"M\": %d, \"N\": %d, \"K\": %d, \"ours_ms\": %.6f, \"cublas_ms\": %.6f, \"ours_tflops\": %.4f, "
+              "\"cublas_tflops\": %.4f, \"ours_gbs\": %.2f, \"cublas_gbs\": %.2f, \"frac_of_cublas\": %.4f, \"relmax\": %.3e, \"cublas_relmax\": %.3e, "
+              "\"persist_bitwise\": \"%s\", \"pass\": %s}\n", cs.name.c_str(), (int)OFA_GEMM_BACKEND, M, N, K, tours, tcb, bench ? fl / tours * 1e-9 : 0.0,
+              bench ? fl / tcb * 1e-9 : 0.0, bench ? by / tours * 1e-6 : 0.0, bench ? by / tcb * 1e-6 : 0.0, bench && tours > 0 ? tcb / tours : 0.0, s.rmax, sc.rmax,
+              pers.c_str(), ok ? "true" : "false"); fclose(jf); } }
     fflush(stdout);
     if (!ok) nfail++;
     cudaFree(A); cudaFree(B); cudaFree(C); cudaFree(C2); cudaFree(CB_); cudaFree(ref); cudaFree(dord);

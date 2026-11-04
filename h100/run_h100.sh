@@ -205,5 +205,19 @@ if has mm_mps; then
     "$OUT/mm_vllm.json" $(ls "$OUT"/mm_vllm_ded_m*.json "$OUT"/mm_vllm_mps.json 2>/dev/null)
 fi
 has score_mm && python3 "$ROOT/h100/mm_score.py" "$OUT"
+
+# ---- wgmma GEMM microbenchmark: megakernel tile shapes (Qwen3-0.6B/4B decode B1/8/32 padded to the 128-row tile, trunk M=2048) ----
+# mma.sync (backend 0) vs OFA wgmma/TMA (backend 3), cuBLAS timed beside each; bitwise persistent-shuffled vs same-tile run.
+WGF="-arch=sm_90a -O3 -std=c++17 test_gemm_r2.cu -lcublas"
+has build_wgmma && dk $PT_IMG build_wgmma.log -- "cd llm/b200/gemm_tcgen05 && nvcc -DOFA_GEMM_BACKEND=0 -o /out/gemm_bench_mma $WGF && nvcc -DOFA_GEMM_BACKEND=3 -o /out/gemm_bench_wg $WGF"
+if has wgmma; then
+  rm -f "$OUT/wgmma_cases.jsonl"
+  for X in mma wg; do
+    if [ -x "$OUT/gemm_bench_$X" ]; then
+      dcgm_on wgmma_$X; dk $PT_IMG wgmma_$X.log -e GEMM_CASES=h100mm -e GEMM_JSON=/out/wgmma_cases.jsonl -- "timeout -k 10 1800 /out/gemm_bench_$X"; dcgm_off
+    else echo "wgmma: /out/gemm_bench_$X missing (run build_wgmma)"; fi
+  done
+fi
+has score_wgmma && python3 "$ROOT/h100/wgmma_score.py" "$OUT"
 has score && python3 "$ROOT/h100/score.py" "$OUT" ${COSCHED_SUMMARY:+--cosched-summary "$COSCHED_SUMMARY"}
 echo "artifacts: $OUT"

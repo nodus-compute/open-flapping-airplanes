@@ -82,6 +82,7 @@ def main(out):
         r = json.loads(p.read_text())
         gates[f"hf_tolerance_{p.stem}"] = r["pass"]
     summary = {"rows": rows, "gates": gates, "all_gates_pass": bool(gates) and all(gates.values()), "dcgm_vllm_mps": dcgm(out, "mm_vllm_mps")}
+    summary["gemm_backend"] = "cuda_core_gemv"
     (out / "mm_summary.json").write_text(json.dumps(summary, indent=1))
     keys = ["b", "solo_0p6b_tok_s", "solo_4b_tok_s", "fused_0p6b_tok_s", "fused_4b_tok_s", "fused_vs_2_dedicated_tokens", "fused_U_gpu_equiv",
             "vllm_mps_U_gpu_equiv", "fused_vs_vllm_mps_tokens", "0p6b_p99_vs_solo", "4b_p99_vs_solo"]

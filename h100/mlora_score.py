@@ -59,6 +59,7 @@ def main(out):
         "vllm_version": vllm.get("vllm"), "rows": rows, "gates": gates, "all_gates_pass": bool(gates) and all(gates.values()),
         "pytorch_refs": refs,
     }
+    summary["gemm_backend"] = "cuda_core_gemv"
     (out / "ml_summary.json").write_text(json.dumps(summary, indent=1))
     keys = ["b", "adapters", "ofa_none_tok_s", "ofa_loop_tok_s", "ofa_sgmv_tok_s", "sgmv_vs_loop", "sgmv_vs_none", "sgmv_vs_pytorch_loop",
             "sgmv_vs_pytorch_gather", "vllm_stock_lora_vs_no_adapter", "bitwise_sgmv_vs_loop"]
